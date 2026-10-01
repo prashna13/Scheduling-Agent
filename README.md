@@ -1,11 +1,11 @@
-# Saathi Sneha Care – Scheduling Sub-Agent (Week 1)
+# Saathi Sneha Care - Scheduling Sub-Agent (Week 1)
 
 LangChain-based Scheduling Sub-Agent for **Saathi Sneha Care**.  
 This Week-1 deliverable reads the shared Excel calendar mockup, checks staff availability, detects booking conflicts, and proposes conflict-free slots. Writes to the Excel calendar are strictly protected behind Human-in-the-Loop (HITL) approval.
 
 ---
 
-##  Features (Week 1)
+## Features (Week 1)
 
 - **Excel Database Reader:** Dynamically inspects and extracts schedules from the Excel mockup (`data/Saathi_Sneha_Care_Scheduling_Calendar_Mockup.xlsx`).
 - **Shift & Availability Checking:** Maps dates to weekdays and evaluates staff shift windows against `"Off"` days.
@@ -16,7 +16,7 @@ This Week-1 deliverable reads the shared Excel calendar mockup, checks staff ava
 
 ---
 
-##  Project Structure
+## Project Structure
 
 ```text
 ├── calendar_engine.py      # Core Excel parsing & scheduling logic (pandas + openpyxl)
@@ -31,7 +31,7 @@ This Week-1 deliverable reads the shared Excel calendar mockup, checks staff ava
 
 ---
 
-## ⚙️ Setup & Installation
+## Setup & Installation
 
 1. **Create and activate a virtual environment:**
 
@@ -57,7 +57,7 @@ This Week-1 deliverable reads the shared Excel calendar mockup, checks staff ava
    GOOGLE_API_KEY=your_gemini_api_key_here
    # or OPENAI_API_KEY=your_openai_key_here
    ```
-   > **Note:** The agent includes a built-in deterministic fallback router, so it runs completely out-of-the-box even without an LLM API key!
+   > **Note:** The agent includes a built-in deterministic fallback router, so it runs completely out-of-the-box even without an LLM API key.
 
 ---
 
@@ -104,7 +104,7 @@ pytest test_engine.py -v
 
 ---
 
-## 🛠️ Tool Interfaces (Stable API)
+## Tool Interfaces (Stable API)
 
 These tool signatures are designed to be stable so that the underlying Excel storage can later be migrated to a production database/API without modifying agent logic:
 
@@ -117,7 +117,7 @@ These tool signatures are designed to be stable so that the underlying Excel sto
 
 ---
 
-## 🛡️ Safety & Guardrails (Week 1)
+## Safety & Guardrails (Week 1)
 
 1. **Zero Unsupervised Writes:** The agent never commits rows to Excel autonomously. All write actions halt until explicit human approval (`approved_by`) is provided.
 2. **Zero Medical Advice / Triage:** Hard guardrail. Any clinical diagnosis, emergency (e.g. *"patient fell"*), or medical advice request bypasses scheduling and escalates immediately to a human coordinator.
@@ -125,7 +125,7 @@ These tool signatures are designed to be stable so that the underlying Excel sto
 
 ---
 
-## 📝 Technical Notes
+## Technical Notes
 
 - **Excel as Database:** Uses `pandas` for dynamic header resolution and multi-sheet reading; uses `openpyxl` for safe append writes preserving formulas.
 - **Decoupled Architecture:** Core calendar logic (`calendar_engine.py`) is completely independent of the LLM layer (`langchain_agent.py`), allowing easy testing and model switching.
