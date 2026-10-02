@@ -1,24 +1,35 @@
 """
-LangChain Scheduling Agent Skeleton for Saathi Sneha Care.
-Week 1 Deliverable: Reads the Excel calendar mockup and answers availability queries
-such as "is Dr. X available on date Y?".
+LangChain Scheduling Agent for Saathi Sneha Care.
+Equipped strictly with the 4 core tools:
+1. read_availability
+2. check_conflict
+3. propose_slot
+4. write_booking
+
+Model Configuration:
+- Primary: openai/gpt-oss-120b:free (via OpenRouter / OpenAI API)
+- Secondary: Google Gemini (gemini-1.5-flash)
+- Fallback: Deterministic 4-tool conversational engine
 """
 
 import os
 import re
 import json
+import unicodedata
 from typing import Optional, Dict, Any, List
+import requests
 from dotenv import load_dotenv
 
-# Load environment variables (API keys from .env if present)
 load_dotenv()
 
-# Import core deterministic calendar logic
+# Import the 4 core calendar tools
 from calendar_engine import (
-    is_doctor_available,
     read_availability,
+    check_conflict,
     propose_slot,
-    check_conflict
+    write_booking,
+    parse_date,
+    load_sheet
 )
 
 # LangChain Imports
@@ -29,145 +40,238 @@ try:
     LANGCHAIN_INSTALLED = True
 except ImportError:
     LANGCHAIN_INSTALLED = False
-    # Lightweight fallback decorator if langchain is not yet installed in environment
     def tool(func):
+        func.name = func.__name__
+        func.description = func.__doc__
         func.is_tool = True
         return func
 
 
-# ==========================================
-# 🛠️ 1. LANGCHAIN TOOLS DEFINITION
-# ==========================================
+# =========================================================================
+# 🛠️ THE 4 CORE TOOLS (REGISTERED FOR AGENT)
+# =========================================================================
 
 @tool
-def check_doctor_availability_tool(
-    doctor_name_or_id: str, 
-    date: str, 
-    time_slot: Optional[str] = None
-) -> str:
+def read_availability_tool(date_range: str, role: str = "Nurse") -> str:
     """
-    Checks if a specific Doctor or Nurse is available on a given date (and optional time slot)
-    by reading the Saathi Sneha Care Excel schedule.
+    TOOL 1: Reads the Staff Availability sheet and returns all staff matching the role
+    who are scheduled to work on the given date (excluding 'Off' days).
     
     Args:
-        doctor_name_or_id: Name (e.g. 'Dr. Ramesh Iyer') or ID (e.g. 'DR-01') of the staff member.
-        date: The target date formatted as YYYY-MM-DD (e.g. '2026-09-28') or standard date string.
-        time_slot: Optional time window to check (e.g. '10:00 AM - 11:00 AM').
-    
-    Returns:
-        A formatted JSON string with availability status, working hours, conflicts, and reason.
+        date_range: Target date formatted as YYYY-MM-DD (e.g. '2026-09-24').
+        role: 'Nurse' or 'Doctor' (default: 'Nurse').
     """
-    res = is_doctor_available(
-        doctor_name_or_id=doctor_name_or_id,
-        date_val=date,
-        slot_str=time_slot
-    )
+    res = read_availability(date_range=date_range, role=role)
     return json.dumps(res, indent=2)
 
 
 @tool
-def read_staff_availability_tool(
-    date: str, 
-    role: str = "Doctor"
-) -> str:
+def check_conflict_tool(staff_id: str, slot: str, date: str) -> str:
     """
-    Retrieves all staff members matching a role who are scheduled to work on a specific date.
+    TOOL 2: Checks whether a proposed time slot conflicts with an active booking in the
+    Bookings Calendar or falls outside the staff member's working hours.
     
     Args:
-        date: Target date in YYYY-MM-DD format (e.g. '2026-09-28').
-        role: 'Doctor' or 'Nurse' (default: 'Doctor').
+        staff_id: Staff ID (e.g. 'NR-01', 'DR-01') or Staff Name.
+        slot: Proposed time slot (e.g. '10:00 AM - 11:00 AM').
+        date: Target date formatted as YYYY-MM-DD.
     
     Returns:
-        JSON string listing staff names, specialties, service areas, and shift hours.
+        JSON string indicating {"conflict": True/False, "available": True/False}.
     """
-    res = read_availability(date_range=date, role=role)
-    return json.dumps(res, indent=2)
+    has_conflict = check_conflict(staff_id=staff_id, slot=slot, date=date)
+    return json.dumps({
+        "staff_id": staff_id,
+        "date": date,
+        "slot": slot,
+        "has_conflict": has_conflict,
+        "available": not has_conflict
+    }, indent=2)
 
 
 @tool
-def propose_available_slots_tool(
-    date: str,
-    role: str = "Doctor",
+def propose_slot_tool(
+    role: str = "Nurse",
     specialty: Optional[str] = None,
+    date: Optional[str] = None,
     area: Optional[str] = None,
-    time_slot: Optional[str] = None
+    slot: Optional[str] = None
 ) -> str:
     """
-    Finds and proposes conflict-free candidate staff and available time slots
-    matching patient intake criteria (role, specialty, date, and geographic service area).
+    TOOL 3: Evaluates staff shifts and booking conflicts to propose the top 2-3
+    conflict-free candidate staff members and available time windows.
     
     Args:
+        role: 'Nurse' or 'Doctor'.
+        specialty: Optional specialty (e.g. 'Geriatric care', 'Elderly / palliative care').
         date: Target appointment date (YYYY-MM-DD).
-        role: 'Doctor' or 'Nurse'.
-        specialty: Optional medical specialty (e.g. 'Geriatric care', 'General physician').
-        area: Optional neighborhood/locality (e.g. 'Andheri', 'Powai', 'Bandra').
-        time_slot: Optional desired time window (e.g. '10:00 AM - 11:00 AM').
+        area: Optional neighborhood/locality (e.g. 'Bandra', 'Powai', 'Andheri').
+        slot: Optional desired time slot.
     """
     res = propose_slot(
         role=role,
         specialty=specialty,
         date=date,
         area=area,
-        slot=time_slot
+        slot=slot
     )
     return json.dumps(res, indent=2)
 
 
-SCHEDULE_TOOLS = [
-    check_doctor_availability_tool,
-    read_staff_availability_tool,
-    propose_available_slots_tool
+@tool
+def write_booking_tool(booking_data: dict, approved_by: str) -> str:
+    """
+    TOOL 4: Human-in-the-loop coordinator approval gate.
+    Validates the booking draft and requires a non-empty approved_by coordinator ID.
+    """
+    res = write_booking(booking_data=booking_data, approved_by=approved_by)
+    return json.dumps(res, indent=2)
+
+
+CORE_TOOLS = [
+    read_availability_tool,
+    check_conflict_tool,
+    propose_slot_tool,
+    write_booking_tool
 ]
 
 
-# ==========================================
-# 🤖 2. AGENT INITIALIZATION & RUNNER
-# ==========================================
+# =========================================================================
+# 🤖 MODEL PROMPT & CONFIGURATION
+# =========================================================================
 
-SYSTEM_PROMPT = """You are the AI Scheduling Sub-Agent for Saathi Sneha Care, a home healthcare provider.
-Your primary role in Week 1 is to accurately answer staff availability queries (e.g. "Is Dr. X available on date Y?") by inspecting the Excel database.
+SYSTEM_PROMPT = """You are the friendly, professional AI Care Coordinator for Saathi Sneha Care in Mumbai.
+You communicate conversationally with clients and coordinators to check doctor and nurse availability for home healthcare visits.
 
-Strict Safety & Operational Rules:
-1. ZERO MEDICAL ADVICE: Never provide medical diagnosis, clinical triage, or treatment guidance. If a query describes an emergency (e.g. 'my father fell'), immediately escalate to human care coordinators.
-2. ACCURATE EXCEL LOOKUPS: Always use your tools (`check_doctor_availability_tool`, `read_staff_availability_tool`, `propose_available_slots_tool`) to verify shifts and bookings before stating availability.
-3. CONFLICT AWARENESS: Distinguish between a staff member being marked 'Off' on a weekday versus having an existing booking conflict in the Bookings Calendar.
-4. CLEAR RESPONSES: Provide concise, courteous, and precise answers including working hours and exact reason for availability or conflict.
+You have access to exactly 4 core tools:
+1. `read_availability_tool`: Look up staff on duty for a date.
+2. `check_conflict_tool`: Check if a staff member has a time slot conflict or is off.
+3. `propose_slot_tool`: Propose 2-3 conflict-free time slots for available staff.
+4. `write_booking_tool`: Stage an approved booking (requires coordinator approved_by).
 """
 
-def get_langchain_agent_executor() -> Optional[Any]:
+LLM_CONVERSATIONAL_PROMPT = """You are the friendly, professional AI Care Coordinator for Saathi Sneha Care in Mumbai communicating with patients and families over WhatsApp and social messaging.
+
+Rules:
+1. Ground your response strictly on the verified schedule information provided.
+2. If staff is available, greet warmly, confirm their availability on that day, and propose the 2-3 time slots.
+3. If staff is unavailable (marked Off or booked), explain why and offer the alternative staff members and their available slots.
+4. Always speak directly to the patient in full, natural, empathetic sentences. Never mention tool names, function names, or internal code.
+5. ZERO MEDICAL ADVICE: Never diagnose or provide medical treatments."""
+
+PRIMARY_MODEL = os.getenv("PRIMARY_MODEL", "openai/gpt-oss-120b")
+SECONDARY_MODEL = os.getenv("SECONDARY_MODEL", "gemini-2.5-flash")
+
+
+def call_openrouter_api(query: str, api_key: str, model_name: str = PRIMARY_MODEL) -> Optional[str]:
+    """Direct API caller for OpenRouter openai/gpt-oss-120b grounded by 4 core tools."""
+    url = os.getenv("OPENAI_BASE_URL", "https://openrouter.ai/api/v1/chat/completions")
+    if not url.endswith("/chat/completions"):
+        url = url.rstrip("/") + "/chat/completions"
+        
+    headers = {
+        "Authorization": f"Bearer {api_key.strip()}",
+        "HTTP-Referer": "https://saathisnehacare.org",
+        "X-Title": "Saathi Sneha Care Scheduling Agent",
+        "Content-Type": "application/json"
+    }
+    
+    # Ground LLM with verified 4-tool deterministic calculation
+    grounded_eval = fallback_answer_query(query)
+    
+    messages = [
+        {"role": "system", "content": f"{LLM_CONVERSATIONAL_PROMPT}\n\nVerified Real-Time Calendar Schedule Info:\n{grounded_eval}"},
+        {"role": "user", "content": f"Write the patient response for this inquiry: '{query}'"}
+    ]
+    
+    payload = {
+        "model": model_name,
+        "messages": messages,
+        "temperature": 0.3
+    }
+    
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=12)
+        if resp.status_code == 200:
+            data = resp.json()
+            content = data["choices"][0]["message"]["content"]
+            if content and not content.strip().lower().startswith("we need to call") and not content.strip().lower().startswith("we will call"):
+                return unicodedata.normalize("NFKC", content)
+    except Exception:
+        pass
+    return None
+
+
+def call_gemini_api(query: str, api_key: str, model_name: str = SECONDARY_MODEL) -> Optional[str]:
+    """Direct REST API caller for Google Gemini grounded by 4 core tools."""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key.strip()}"
+    headers = {"Content-Type": "application/json"}
+    
+    grounded_eval = fallback_answer_query(query)
+    
+    prompt_text = (
+        f"{LLM_CONVERSATIONAL_PROMPT}\n\n"
+        f"Verified Real-Time Calendar Schedule Info:\n{grounded_eval}\n\n"
+        f"Patient Query: {query}\n"
+        f"Write the final direct conversational response to the patient."
+    )
+    
+    payload = {
+        "contents": [{"parts": [{"text": prompt_text}]}],
+        "generationConfig": {"temperature": 0.3}
+    }
+    
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=12)
+        if resp.status_code == 200:
+            data = resp.json()
+            candidates = data.get("candidates", [])
+            if candidates:
+                content = candidates[0]["content"]["parts"][0]["text"]
+                if content and not content.strip().lower().startswith("we need to call") and not content.strip().lower().startswith("we will call"):
+                    return unicodedata.normalize("NFKC", content)
+    except Exception:
+        pass
+    return None
+
+
+def get_langchain_agent_executor(api_key_override: Optional[str] = None) -> Optional[Any]:
     """
-    Initializes and returns a LangChain AgentExecutor if an LLM is configured.
-    Supports Google Gemini, OpenAI, or Anthropic based on available environment keys.
+    Initializes primary LLM (OpenRouter / OpenAI gpt-oss-120b:free) or secondary (Google Gemini).
     """
     if not LANGCHAIN_INSTALLED:
         return None
         
     llm = None
     
-    # 1. Google Gemini (Preferred default)
-    if os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY"):
-        try:
-            from langchain_google_genai import ChatGoogleGenerativeAI
-            api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
-            llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=api_key, temperature=0)
-        except Exception:
-            pass
-            
-    # 2. OpenAI
-    if llm is None and os.getenv("OPENAI_API_KEY"):
+    # 1. PRIMARY: OpenRouter / OpenAI (openai/gpt-oss-120b:free)
+    openrouter_key = api_key_override or os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY")
+    if openrouter_key:
+        base_url = os.getenv("OPENAI_BASE_URL", "https://openrouter.ai/api/v1")
         try:
             from langchain_openai import ChatOpenAI
-            llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+            llm = ChatOpenAI(
+                model=PRIMARY_MODEL,
+                openai_api_key=openrouter_key,
+                openai_api_base=base_url,
+                temperature=0.3
+            )
         except Exception:
             pass
-            
-    # 3. Groq / Local / Ollama fallbacks
-    if llm is None and os.getenv("GROQ_API_KEY"):
-        try:
-            from langchain_groq import ChatGroq
-            llm = ChatGroq(model_name="llama-3.1-70b-versatile", temperature=0)
-        except Exception:
-            pass
+
+    # 2. SECONDARY: Google Gemini
+    if llm is None:
+        gemini_key = api_key_override or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+        if gemini_key:
+            try:
+                from langchain_google_genai import ChatGoogleGenerativeAI
+                llm = ChatGoogleGenerativeAI(
+                    model=SECONDARY_MODEL,
+                    google_api_key=gemini_key,
+                    temperature=0.3
+                )
+            except Exception:
+                pass
             
     if llm is None:
         return None
@@ -179,129 +283,153 @@ def get_langchain_agent_executor() -> Optional[Any]:
         MessagesPlaceholder(variable_name="agent_scratchpad"),
     ])
     
-    agent = create_tool_calling_agent(llm, SCHEDULE_TOOLS, prompt)
-    return AgentExecutor(agent=agent, tools=SCHEDULE_TOOLS, verbose=True)
+    agent = create_tool_calling_agent(llm, CORE_TOOLS, prompt)
+    return AgentExecutor(agent=agent, tools=CORE_TOOLS, verbose=False)
 
 
-# ==========================================
-# ⚡ 3. DETERMINISTIC INTENT FALLBACK ROUTER
-# ==========================================
+# =========================================================================
+# 💬 CONVERSATIONAL FALLBACK ROUTER (4 CORE TOOLS)
+# =========================================================================
 
 def fallback_answer_query(query: str) -> str:
     """
-    Deterministic rule-based agent fallback.
-    Parses availability questions directly and calls the appropriate calendar tools,
-    ensuring 100% functionality even when no LLM API key is configured.
+    Deterministic conversational engine powered strictly by the 4 core tools:
+    `read_availability`, `check_conflict`, `propose_slot`, `write_booking`.
     """
     query_lower = query.lower()
     
-    # Extract date (YYYY-MM-DD or standard formats)
+    # Extract date
     date_match = re.search(r'(\d{4}[-/]\d{1,2}[-/]\d{1,2})', query)
     target_date = date_match.group(1).replace('/', '-') if date_match else None
     
-    # Extract time slot if mentioned (e.g. 10:00 AM - 11:00 AM or 3 PM - 4 PM)
+    # Extract slot
     slot_match = re.search(r'(\d{1,2}(?::\d{2})?\s*(?:am|pm)\s*[-–—to]+\s*\d{1,2}(?::\d{2})?\s*(?:am|pm))', query, re.I)
     target_slot = slot_match.group(1) if slot_match else None
     
-    # Check for doctor/nurse names
-    staff_names = [
-        "Dr. Ramesh Iyer", "Dr. Priya Nair", 
-        "Nurse Anjali Fernandes", "Nurse Sunita Rao", "Nurse Meera Joshi",
-        "DR-01", "DR-02", "NR-01", "NR-02", "NR-03"
+    # Identify role
+    role = "Nurse" if "nurse" in query_lower or "nr-" in query_lower else "Doctor"
+    
+    # Identify requested staff
+    staff_registry = [
+        ("Nurse Anjali Fernandes", "NR-01", "Nurse"),
+        ("Nurse Sunita Rao", "NR-02", "Nurse"),
+        ("Nurse Meera Joshi", "NR-03", "Nurse"),
+        ("Dr. Ramesh Iyer", "DR-01", "Doctor"),
+        ("Dr. Priya Nair", "DR-02", "Doctor")
     ]
     
-    found_staff = None
-    for name in staff_names:
-        if name.lower() in query_lower:
-            found_staff = name
+    target_staff = None
+    for name, s_id, s_role in staff_registry:
+        last_name = name.split()[-1].lower()
+        if (name.lower() in query_lower or s_id.lower() in query_lower or last_name in query_lower):
+            target_staff = (name, s_id, s_role)
+            role = s_role
             break
+
+    # SCENARIO 1: Checking specific staff on date
+    if target_staff and target_date:
+        s_name, s_id, s_role = target_staff
+        
+        # Tool 1: Check availability
+        staff_on_duty = read_availability(date_range=target_date, role=s_role)
+        is_on_duty = any(s["staff_id"] == s_id for s in staff_on_duty)
+        
+        # Tool 2: Check conflict
+        has_conflict = check_conflict(staff_id=s_id, slot=target_slot or "10:00 AM - 11:00 AM", date=target_date) if target_slot else check_conflict(staff_id=s_id, slot="", date=target_date)
+        
+        # Tool 3: Propose slots
+        cands = propose_slot(role=s_role, date=target_date, slot=target_slot)
+        matching_cand = next((c for c in cands if c["staff_id"] == s_id), None)
+        
+        parsed_d = parse_date(target_date)
+        date_friendly = parsed_d.strftime("%A, %B %d, %Y") if parsed_d else target_date
+        
+        if is_on_duty and matching_cand:
+            slots = matching_cand.get("proposed_slots", [])
+            slots_str = "\n".join([f"  • {s}" for s in slots]) if slots else f"  • {matching_cand['working_hours']}"
             
-    # If specific doctor availability query
-    if found_staff and target_date:
-        res = is_doctor_available(doctor_name_or_id=found_staff, date_val=target_date, slot_str=target_slot)
-        if res["available"]:
-            slot_info = f" for slot '{target_slot}'" if target_slot else ""
-            open_slots = f"\n  Available Slots: {', '.join(res.get('available_slots', []))}" if res.get('available_slots') else ""
-            return f"✅ Yes, {res['name']} ({res['staff_id']}) is AVAILABLE on {res['day_of_week']}, {res['date']}{slot_info}.\n  Working Hours: {res['working_hours']}{open_slots}"
+            return (
+                f"Hello! 👋 Great news — **{s_name}** is **available** on **{date_friendly}**.\n\n"
+                f"Their working shift for that day is **{matching_cand['working_hours']}** (Specialty: {matching_cand.get('specialty', 'General')}, Area: {matching_cand.get('service_area', 'Mumbai')}).\n\n"
+                f"Here are 2–3 convenient time slots I can propose for your visit:\n"
+                f"{slots_str}\n\n"
+                f"Would you like me to reserve one of these times for you? 😊"
+            )
         else:
-            return f"❌ No, {res.get('name', found_staff)} is NOT AVAILABLE on {target_date}.\n  Reason: {res.get('reason')}"
-            
-    # If general "who is available on date" query
-    if target_date and ("who is available" in query_lower or "list" in query_lower or "available staff" in query_lower or not found_staff):
-        role = "Nurse" if "nurse" in query_lower else "Doctor"
-        staff_list = read_availability(date_range=target_date, role=role)
-        if not staff_list:
-            return f"No {role}s are scheduled to work on {target_date}."
+            # Offer alternatives using Tool 3 (propose_slot)
+            alt_cands = [c for c in cands if c["staff_id"] != s_id]
+            alt_text = ""
+            if alt_cands:
+                alt_lines = [f"  • **{a['name']}** ({a['specialty']}) — Shift: {a['working_hours']}" for a in alt_cands[:2]]
+                alt_text = f"\n\nHowever, we have other available {s_role.lower()}s on {date_friendly}:\n" + "\n".join(alt_lines) + "\n\nWould you like to check slots with one of them instead?"
+            else:
+                alt_text = f"\n\nWould you like me to check an alternate date for {s_name}?"
+                
+            reason = f"marked 'Off' on {date_friendly}" if not is_on_duty else f"booked or conflicting for the requested time"
+            return (
+                f"Hello! I checked the schedule, but unfortunately **{s_name}** is **not available** on **{date_friendly}** ({reason})."
+                f"{alt_text}"
+            )
+
+    # SCENARIO 2: General "Is a nurse / doctor free on date"
+    if target_date:
+        cands = propose_slot(role=role, date=target_date, slot=target_slot)
+        parsed_d = parse_date(target_date)
+        date_friendly = parsed_d.strftime("%A, %B %d, %Y") if parsed_d else target_date
         
-        lines = [f"📋 {len(staff_list)} {role}(s) working on {target_date}:"]
-        for s in staff_list:
-            lines.append(f"  • {s['name']} ({s['staff_id']}) | Specialty: {s['specialty'] or 'General'} | Hours: {s['working_hours']} | Areas: {s['service_area']}")
-        return "\n".join(lines)
-        
-    # Default guidance
+        if cands:
+            lines = [f"• **{c['name']}** ({c['specialty']}) — Shift: {c['working_hours']} | Proposed Slots: {', '.join(c['proposed_slots'][:2])}" for c in cands]
+            return (
+                f"Hello! 😊 Yes, we have **{len(cands)} {role.lower()}(s)** available on **{date_friendly}**:\n\n"
+                + "\n".join(lines) +
+                f"\n\nWould you like to book a visit with one of them?"
+            )
+        else:
+            return (
+                f"Hello! We currently don't have any {role.lower()}s available on **{date_friendly}**.\n\n"
+                f"Could we check another date for you?"
+            )
+
     return (
-        "LangChain Agent Skeleton Ready.\n"
-        "To check availability, please ask a question containing a staff name and date, for example:\n"
-        "  • 'Is Dr. Ramesh Iyer available on 2026-09-28?'\n"
-        "  • 'Is Dr. Priya Nair available on 2026-09-22 from 3:00 PM to 4:00 PM?'\n"
-        "  • 'Who is available on 2026-09-28?'"
+        "Hello! 👋 Welcome to **Saathi Sneha Care**.\n\n"
+        "I can help you check staff availability and propose home visit slots in Mumbai.\n\n"
+        "Try asking me:\n"
+        "• *'Is Dr. Iyer free on 2026-09-28?'*\n"
+        "• *'Is Nurse Sunita available on 2026-09-24?'*\n"
+        "• *'Is any nurse free on 2026-09-23?'*"
     )
 
 
-def ask_agent(user_query: str) -> str:
+def ask_agent(user_query: str, api_key_override: Optional[str] = None) -> str:
     """
-    Main entry point for asking the LangChain Scheduling Agent questions.
-    Uses LLM tool calling if configured; falls back gracefully to deterministic tool router.
+    Main query entry point:
+    1. Attempts Primary LLM: openai/gpt-oss-120b via OpenRouter
+    2. Attempts Secondary LLM: Google Gemini (gemini-2.5-flash)
+    3. Attempts LangChain Tool-Calling Agent
+    4. Falls back to deterministic 4-tool conversational engine
     """
-    executor = get_langchain_agent_executor()
+    # 1. Primary LLM: OpenRouter (openai/gpt-oss-120b)
+    openrouter_key = api_key_override or os.getenv("OPENROUTER_API_KEY") or (os.getenv("OPENAI_API_KEY") if "sk-or" in (os.getenv("OPENAI_API_KEY") or "") else None)
+    if openrouter_key:
+        direct_resp = call_openrouter_api(user_query, openrouter_key, PRIMARY_MODEL)
+        if direct_resp and direct_resp.strip():
+            return direct_resp
+
+    # 2. Secondary LLM: Google Gemini
+    gemini_key = api_key_override or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+    if gemini_key and "sk-or" not in (gemini_key or ""):
+        gemini_resp = call_gemini_api(user_query, gemini_key, SECONDARY_MODEL)
+        if gemini_resp and gemini_resp.strip():
+            return gemini_resp
+
+    # 3. LangChain Agent
+    executor = get_langchain_agent_executor(api_key_override=api_key_override)
     if executor:
         try:
             result = executor.invoke({"input": user_query})
             return result.get("output", str(result))
-        except Exception as e:
-            print(f"[Notice: LLM invocation failed ({e}). Using deterministic tool execution]")
+        except Exception:
             return fallback_answer_query(user_query)
-    else:
-        return fallback_answer_query(user_query)
 
-
-# ==========================================
-# 🚀 4. INTERACTIVE CLI TESTING
-# ==========================================
-
-if __name__ == "__main__":
-    print("=" * 70)
-    print(" 🏥 SAATHI SNEHA CARE - LANGCHAIN SCHEDULING AGENT SKELETON")
-    print("=" * 70)
-    print("Week 1 Deliverable: Tool-augmented agent for Excel calendar queries.")
-    print("Type your availability questions naturally, or type 'exit' to quit.\n")
-    
-    # Preset test demonstrations
-    sample_queries = [
-        "Is Dr. Ramesh Iyer available on 2026-09-28?",
-        "Is Dr. Ramesh Iyer available on 2026-09-27?",
-        "Is Dr. Priya Nair available on 2026-09-22 between 3:00 PM and 4:00 PM?",
-        "Who is available on 2026-09-28?"
-    ]
-    
-    print("--- 🧪 Running Sample Queries ---")
-    for q in sample_queries:
-        print(f"\nUser: {q}")
-        ans = ask_agent(q)
-        print(f"Agent:\n{ans}")
-        print("-" * 50)
-        
-    print("\n--- 💬 Interactive Mode (Type your own question) ---")
-    while True:
-        try:
-            user_input = input("\nYou: ").strip()
-            if not user_input:
-                continue
-            if user_input.lower() in ("exit", "quit", "q"):
-                print("Exiting agent. Goodbye! 👋")
-                break
-            response = ask_agent(user_input)
-            print(f"\nAgent:\n{response}")
-        except (KeyboardInterrupt, EOFError):
-            print("\nExiting agent.")
-            break
+    # 4. Deterministic 4-tool engine
+    return fallback_answer_query(user_query)

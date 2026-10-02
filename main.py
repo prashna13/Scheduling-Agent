@@ -1,94 +1,97 @@
 """
-Interactive test script for Saathi Sneha Care Scheduling Sub-Agent.
-Run this script to test doctor availability and booking conflict checks interactively.
+Interactive test script for Saathi Sneha Care Scheduling Sub-Agent (Week 2).
+Uses strictly the 4 core calendar tools:
+1. read_availability
+2. check_conflict
+3. propose_slot
+4. write_booking
 """
 
 import sys
 import json
 from calendar_engine import (
-    is_doctor_available,
     read_availability,
-    propose_slot,
     check_conflict,
-    write_booking
+    propose_slot,
+    write_booking,
+    load_sheet
 )
+from langchain_agent import ask_agent
 
 def print_banner():
-    print("=" * 60)
-    print(" SAATHI SNEHA CARE - SCHEDULING AGENT INTERACTIVE TESTER")
-    print("=" * 60)
+    print("=" * 65)
+    print(" SAATHI SNEHA CARE - SCHEDULING AGENT TESTER (WEEK 2)")
+    print("=" * 65)
     print("Options:")
-    print(" 1. Check if a Doctor/Staff is available on a specific Date & Slot")
-    print(" 2. Propose available slots for a Role, Specialty, Date & Area")
-    print(" 3. View all available staff for a Date & Role")
-    print(" 4. Commit a new booking to Excel Calendar (HITL Approved)")
-    print(" 5. Run sample preset tests")
-    print(" 6. Exit")
-    print("=" * 60)
+    print(" 1. Tool 1: Find Available Staff on a Date (read_availability)")
+    print(" 2. Tool 2: Check Time Slot Conflict (check_conflict)")
+    print(" 3. Tool 3: Propose 2-3 Slots & Candidates (propose_slot)")
+    print(" 4. Tool 4: Stage Booking with HITL Approval (write_booking)")
+    print(" 5. View Master Schedule Sheets (Staff Availability & Bookings)")
+    print(" 6. Ask Conversational Agent (Natural Language / Social Media)")
+    print(" 7. Run Preset Test Scenarios")
+    print(" 8. Exit")
+    print("=" * 65)
 
-def ask_check_availability():
-    print("\n--- Check Doctor/Staff Availability ---")
-    doc_name = input("Enter Doctor/Staff Name or ID (e.g. 'Dr. Ramesh Iyer' or 'DR-01'): ").strip()
-    if not doc_name:
-        print("❌ Doctor name cannot be empty.")
-        return
-        
-    date_val = input("Enter Date (YYYY-MM-DD, e.g. '2026-09-28'): ").strip()
+def ask_tool_1_read_availability():
+    print("\n--- Tool 1: read_availability ---")
+    date_val = input("Enter Date (YYYY-MM-DD, e.g. '2026-09-24'): ").strip()
     if not date_val:
-        print("❌ Date cannot be empty.")
+        print("Date cannot be empty.")
         return
-        
-    slot_val = input("Enter Time Slot (optional, e.g. '10:00 AM - 11:00 AM' or press Enter to skip): ").strip()
-    if not slot_val:
-        slot_val = None
-        
-    print("\n🔍 Querying Database...")
-    result = is_doctor_available(doctor_name_or_id=doc_name, date_val=date_val, slot_str=slot_val)
-    
-    print("\n📋 RESULT:")
-    print(json.dumps(result, indent=2))
-    
-    if result["available"]:
-        print(f"\n✅ SUCCESS: {result['name']} IS AVAILABLE!")
-    else:
-        print(f"\n❌ NOT AVAILABLE: {result.get('reason')}")
-
-def ask_propose_slots():
-    print("\n--- Propose Slots for Patient Request ---")
-    role = input("Role (Doctor / Nurse) [default: Doctor]: ").strip() or "Doctor"
-    specialty = input("Specialty (optional, e.g. 'General physician'): ").strip()
-    date_val = input("Date (YYYY-MM-DD, e.g. '2026-09-28'): ").strip()
-    area = input("Area / Locality (e.g. 'Andheri'): ").strip()
-    slot_val = input("Specific Time Slot (optional, e.g. '10:00 AM - 11:00 AM' or Enter to view all open slots): ").strip() or None
-    
-    print("\n🔍 Searching for candidates...")
-    candidates = propose_slot(role=role, specialty=specialty, date=date_val, area=area, slot=slot_val)
-    
-    print(f"\n📋 FOUND {len(candidates)} CANDIDATE(S):")
-    print(json.dumps(candidates, indent=2))
-
-def ask_read_availability():
-    print("\n--- View All Available Staff for Date & Role ---")
-    date_val = input("Date (YYYY-MM-DD, e.g. '2026-09-28'): ").strip()
-    role = input("Role (Doctor / Nurse) [default: Doctor]: ").strip() or "Doctor"
+    role = input("Role (Nurse / Doctor) [default: Nurse]: ").strip() or "Nurse"
     
     results = read_availability(date_range=date_val, role=role)
-    print(f"\n📋 {len(results)} Staff Member(s) working on {date_val}:")
+    print(f"\n Found {len(results)} {role}(s) working on {date_val}:")
     print(json.dumps(results, indent=2))
 
-def ask_write_booking():
-    print("\n--- Commit New Booking to Excel (HITL Protected) ---")
-    approved_by = input("Enter Coordinator ID / Name for Human Approval: ").strip()
+def ask_tool_2_check_conflict():
+    print("\n--- Tool 2: check_conflict ---")
+    staff_id = input("Enter Staff ID or Name (e.g. 'NR-02' or 'Nurse Sunita Rao'): ").strip()
+    if not staff_id:
+        print("Staff identifier cannot be empty.")
+        return
+    date_val = input("Enter Date (YYYY-MM-DD, e.g. '2026-09-21'): ").strip()
+    if not date_val:
+        print("Date cannot be empty.")
+        return
+    slot_val = input("Enter Time Slot (e.g. '10:30 AM - 11:30 AM'): ").strip()
+    if not slot_val:
+        print("Slot cannot be empty.")
+        return
+        
+    has_conflict = check_conflict(staff_id=staff_id, slot=slot_val, date=date_val)
+    print(f"\n Conflict Result: {has_conflict}")
+    if has_conflict:
+        print(f" NOT AVAILABLE: Conflict detected or staff is off for slot {slot_val} on {date_val}.")
+    else:
+        print(f" AVAILABLE: No conflict found for {staff_id} during {slot_val} on {date_val}.")
+
+def ask_tool_3_propose_slot():
+    print("\n--- Tool 3: propose_slot ---")
+    role = input("Role (Nurse / Doctor) [default: Nurse]: ").strip() or "Nurse"
+    specialty = input("Specialty (optional, e.g. 'Elderly / palliative care'): ").strip() or None
+    date_val = input("Date (YYYY-MM-DD, e.g. '2026-09-24'): ").strip()
+    area = input("Area / Locality (optional, e.g. 'Bandra'): ").strip() or None
+    slot_val = input("Specific Time Slot (optional, e.g. '10:00 AM - 11:00 AM' or Enter for open slots): ").strip() or None
+    
+    candidates = propose_slot(role=role, specialty=specialty, date=date_val, area=area, slot=slot_val)
+    print(f"\n Found {len(candidates)} Candidate(s) with proposed 2-3 slots:")
+    print(json.dumps(candidates, indent=2))
+
+def ask_tool_4_write_booking():
+    print("\n--- Tool 4: write_booking (HITL Validation Gate) ---")
+    approved_by = input("Enter Coordinator ID for Human Approval: ").strip()
     if not approved_by:
-        print("❌ Write halted: approved_by cannot be empty.")
+        print("Write halted: approved_by coordinator ID is required.")
         return
         
     patient = input("Patient Name: ").strip()
     date_val = input("Date (YYYY-MM-DD): ").strip()
     slot = input("Time Slot (e.g. '10:00 AM - 11:00 AM'): ").strip()
-    staff = input("Assigned Staff (e.g. 'Dr. Ramesh Iyer'): ").strip()
-    role = input("Staff Role (Doctor / Nurse): ").strip()
-    service = input("Service Type (e.g. 'General checkup'): ").strip()
+    staff = input("Assigned Staff (e.g. 'Nurse Sunita Rao'): ").strip()
+    role = input("Staff Role (Nurse / Doctor): ").strip() or "Nurse"
+    service = input("Service Type (e.g. 'Wound care'): ").strip()
     contact = input("Contact Number: ").strip()
     area = input("Address / Area: ").strip()
     notes = input("Notes: ").strip()
@@ -108,45 +111,64 @@ def ask_write_booking():
     
     try:
         res = write_booking(payload, approved_by=approved_by)
-        print("\n✅ SUCCESS:")
+        print("\n SUCCESS:")
         print(json.dumps(res, indent=2))
     except Exception as e:
-        print(f"\n❌ ERROR: {e}")
+        print(f"\n ERROR: {e}")
+
+def view_master_sheets():
+    print("\n--- Master Sheet: Staff Availability ---")
+    print(load_sheet("Staff Availability").to_string(index=False))
+    print("\n--- Master Sheet: Bookings Calendar ---")
+    print(load_sheet("Bookings Calendar").to_string(index=False))
+
+def ask_nl_agent():
+    print("\n--- Conversational Scheduling Agent (Social Media / WhatsApp) ---")
+    q = input("Ask a question (e.g. 'Is Dr. Iyer free on 2026-09-28?'): ").strip()
+    if not q:
+        return
+    print("\nAgent Response:")
+    print(ask_agent(q))
 
 def run_preset_tests():
-    print("\n--- Running Preset Tests ---")
+    print("\n--- Running Week 2 Preset Tests ---")
     samples = [
-        ("Dr. Ramesh Iyer", "2026-09-28", "10:00 AM - 11:00 AM"),
-        ("Dr. Ramesh Iyer", "2026-09-27", None),
-        ("Dr. Priya Nair", "2026-09-22", "3:00 PM - 4:00 PM"),
-        ("Dr. Priya Nair", "2026-09-22", "4:00 PM - 5:00 PM"),
-        ("Nurse Sunita Rao", "2026-09-24", "9:00 AM - 10:00 AM")
+        "Is Nurse Sunita Rao free on 2026-09-24?",
+        "Is Nurse Sunita Rao free on 2026-09-21 between 10:30 AM and 11:30 AM?",
+        "Is a nurse free on 2026-09-24?",
+        "Is Nurse Meera Joshi free on 2026-09-27?",
+        "Is Dr. Ramesh Iyer available on 2026-09-28?",
+        "Is Dr. Priya Nair free on 2026-09-27?"
     ]
-    for doc, dt, sl in samples:
-        print(f"\n Testing: {doc} on {dt} (Slot: {sl or 'Any'})")
-        res = is_doctor_available(doc, dt, sl)
-        status = "✅ AVAILABLE" if res["available"] else " CONFLICT/OFF"
-        print(f"   Status: {status} | Reason: {res.get('reason')}")
+    for q in samples:
+        print(f"\n Query: {q}")
+        ans = ask_agent(q)
+        print(f"Response:\n{ans}")
+        print("-" * 50)
 
 def main():
     while True:
         print_banner()
-        choice = input("Select an option (1-6): ").strip()
+        choice = input("Select an option (1-8): ").strip()
         if choice == "1":
-            ask_check_availability()
+            ask_tool_1_read_availability()
         elif choice == "2":
-            ask_propose_slots()
+            ask_tool_2_check_conflict()
         elif choice == "3":
-            ask_read_availability()
+            ask_tool_3_propose_slot()
         elif choice == "4":
-            ask_write_booking()
+            ask_tool_4_write_booking()
         elif choice == "5":
-            run_preset_tests()
+            view_master_sheets()
         elif choice == "6":
-            print("\nExiting tester. Good luck with your internship! 👋")
+            ask_nl_agent()
+        elif choice == "7":
+            run_preset_tests()
+        elif choice == "8":
+            print("\nExiting tester. Week 2 Scheduling Agent ready.")
             break
         else:
-            print("\n❌ Invalid choice. Please select 1-6.")
+            print("\nInvalid choice. Please select 1-8.")
         input("\nPress Enter to continue...")
 
 if __name__ == "__main__":
