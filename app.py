@@ -149,7 +149,10 @@ if user_input:
     # Agent checks the Excel database single source of truth & generates natural response
     with st.chat_message("assistant", avatar="🏥"):
         with st.spinner("Checking schedule & availability..."):
-            reply = ask_agent(user_query=user_input)
+            reply = ask_agent(
+                user_query=user_input,
+                chat_history=st.session_state["messages"]
+            )
             st.markdown(reply)
             st.session_state["messages"].append({"role": "assistant", "content": reply})
 

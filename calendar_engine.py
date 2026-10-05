@@ -8,11 +8,22 @@ import pandas as pd
 
 EXCEL_PATH = os.path.join("data", "Saathi_Sneha_Care_Scheduling_Calendar_Mockup.xlsx")
 
+# Thread-safe in-memory cache mapped by (excel_path, sheet_name) -> (mtime, pd.DataFrame)
+_SHEET_CACHE: Dict[Tuple[str, str], Tuple[float, pd.DataFrame]] = {}
+
 
 def load_sheet(sheet_name: str, excel_path: str = EXCEL_PATH) -> pd.DataFrame:
-    """Safely loads a specified sheet from the Excel mockup with dynamic header resolution."""
+    """Safely loads a specified sheet from the Excel mockup with in-memory caching and dynamic header resolution."""
     if not os.path.exists(excel_path):
         raise FileNotFoundError(f"Database file not found at {excel_path}")
+    
+    current_mtime = os.path.getmtime(excel_path)
+    cache_key = (os.path.abspath(excel_path), sheet_name)
+    
+    if cache_key in _SHEET_CACHE:
+        cached_mtime, cached_df = _SHEET_CACHE[cache_key]
+        if cached_mtime == current_mtime:
+            return cached_df.copy()
     
     raw_df = pd.read_excel(excel_path, sheet_name=sheet_name, header=None)
     header_idx = None
@@ -30,7 +41,22 @@ def load_sheet(sheet_name: str, excel_path: str = EXCEL_PATH) -> pd.DataFrame:
     df = pd.read_excel(excel_path, sheet_name=sheet_name, header=header_idx)
     if target_key in df.columns:
         df = df.dropna(subset=[target_key]).copy()
-    return df
+        
+    _SHEET_CACHE[cache_key] = (current_mtime, df)
+    return df.copy()
+
+
+def get_staff_registry(excel_path: str = EXCEL_PATH) -> List[Tuple[str, str, str]]:
+    """Dynamically extracts all registered staff (Name, Staff ID, Role) directly from Staff Availability."""
+    df = load_sheet("Staff Availability", excel_path=excel_path)
+    registry = []
+    for _, row in df.iterrows():
+        name = str(row.get('Name', '')).strip()
+        s_id = str(row.get('Staff ID', '')).strip()
+        role = str(row.get('Role', 'Staff')).strip()
+        if name and s_id and s_id.lower() != 'nan':
+            registry.append((name, s_id, role))
+    return registry
 
 
 def parse_date(date_val: Union[str, datetime, date]) -> Optional[date]:
@@ -45,7 +71,10 @@ def parse_date(date_val: Union[str, datetime, date]) -> Optional[date]:
     date_str = str(date_val).strip()
     formats = (
         "%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y", "%d/%m/%Y", 
-        "%B %d, %Y", "%b %d, %Y", "%Y-%m-%d %H:%M:%S"
+        "%d-%b-%Y", "%d-%B-%Y", "%d/%b/%Y", "%d/%B/%Y",
+        "%b-%d-%Y", "%B-%d-%Y", "%b/%d/%Y", "%B/%d/%Y",
+        "%B %d, %Y", "%b %d, %Y", "%d %B %Y", "%d %b %Y",
+        "%Y-%m-%d %H:%M:%S"
     )
     for fmt in formats:
         try:

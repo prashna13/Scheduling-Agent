@@ -9,10 +9,14 @@ from calendar_engine import (
     parse_time_range,
     times_overlap,
     is_time_within_window,
-    get_available_windows
+    get_available_windows,
+    load_sheet,
+    get_staff_registry,
+    _SHEET_CACHE
 )
 from langchain_agent import (
     ask_agent,
+    extract_date_from_query,
     read_availability_tool,
     check_conflict_tool,
     propose_slot_tool,
@@ -48,6 +52,28 @@ def test_available_windows():
     assert "9:00 AM - 10:00 AM" in windows
     assert "10:00 AM - 11:00 AM" not in windows
     assert "11:00 AM - 12:00 PM" in windows
+
+def test_in_memory_cache():
+    df1 = load_sheet("Staff Availability")
+    df2 = load_sheet("Staff Availability")
+    assert df1.equals(df2)
+    assert len(_SHEET_CACHE) > 0
+
+def test_dynamic_staff_registry():
+    registry = get_staff_registry()
+    assert len(registry) >= 5
+    staff_ids = [s[1] for s in registry]
+    assert "DR-01" in staff_ids
+    assert "NR-01" in staff_ids
+
+def test_natural_date_extraction():
+    assert extract_date_from_query("Is Dr. Iyer free on 2026-09-28?") == "2026-09-28"
+    assert extract_date_from_query("Is Nurse Sunita free on Sept 24?") == "2026-09-24"
+    assert extract_date_from_query("Is Dr. Priya available on 23rd September 2026?") == "2026-09-23"
+    assert extract_date_from_query("Any nurse on 21-09-2026?") == "2026-09-21"
+    assert extract_date_from_query("Can I book Dr. Priya Nair on Tuesday, 13-Oct-2026, from 3:00 PM to 4:00 PM?") == "2026-10-13"
+    assert extract_date_from_query("Is Dr. Ramesh Iyer free on Wednesday, 14-Oct-2026, from 11:00 AM to 12:00 PM?") == "2026-10-14"
+    assert extract_date_from_query("Book Dr. Priya on Oct-13-2026") == "2026-10-13"
 
 # ==========================================
 # 2. TOOL 1: read_availability TESTS
@@ -146,3 +172,26 @@ def test_conversational_queries():
     # 3. Ask about Dr. Iyer on Sunday 2026-09-27 (Off day for all doctors)
     ans3 = ask_agent("Is Dr. Iyer free on 2026-09-27?")
     assert "not available" in ans3.lower() or "off" in ans3.lower()
+
+    # 4. User screenshot query 1: Tuesday 13-Oct-2026
+    ans4 = ask_agent("Can I book Dr. Priya Nair on Tuesday, 13-Oct-2026, from 3:00 PM to 4:00 PM?")
+    assert "unable to see" not in ans4.lower()
+    assert "priya" in ans4.lower() or "slot" in ans4.lower() or "available" in ans4.lower()
+
+    # 5. User screenshot query 2: Wednesday 14-Oct-2026
+    ans5 = ask_agent("Is Dr. Ramesh Iyer free on Wednesday, 14-Oct-2026, from 11:00 AM to 12:00 PM?")
+    assert "unable to see" not in ans5.lower()
+    assert "iyer" in ans5.lower() or "available" in ans5.lower() or "slot" in ans5.lower()
+
+    # 6. User screenshot query 3: Non-existent staff member (Dr. John Doe)
+    ans6 = ask_agent("Is Dr. John Doe available on Thursday, 15-Oct-2026?")
+    assert any(p in ans6.lower() for p in ["doesn't exist", "does not exist", "isn't in our system", "not in our system", "in our system"])
+    assert "dr. ramesh iyer" in ans6.lower() or "dr. priya nair" in ans6.lower()
+
+def test_conversational_with_chat_history():
+    history = [
+        {"role": "user", "content": "Hello"},
+        {"role": "assistant", "content": "Welcome to Saathi Sneha Care! How can I help?"}
+    ]
+    ans = ask_agent("Is Dr. Iyer free on 2026-09-28?", chat_history=history)
+    assert "available" in ans.lower() or "free" in ans.lower()
