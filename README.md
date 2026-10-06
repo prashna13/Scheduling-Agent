@@ -67,15 +67,7 @@ This deliverable implements four focused core workflows using the four primary c
    pip install -r requirements.txt
    ```
 
-3. *(Optional)* **Set up API keys for LLM reasoning:**  
-   Create a `.env` file in the root folder (or use `.env.example` as a template):
-   ```env
-   # Primary LLM: openai/gpt-oss-120b:free (via OpenRouter)
-   OPENROUTER_API_KEY=your_openrouter_api_key_here
 
-   # Secondary LLM: Google Gemini (Fallback)
-   GOOGLE_API_KEY=your_gemini_api_key_here
-   ```
 
 ---
 
