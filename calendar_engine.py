@@ -1,5 +1,9 @@
 # Saathi Sneha Care — Scheduling Sub-Agent Core Engine
 # Implements strictly the 4 core tools defined in the project scope.
+# Milestone: Week 3 - Slot Suggestion Engine (2-3 Slots)
+__version__ = "0.3.0"
+__milestone__ = "Week 3: Slot Suggestion Engine"
+
 import os
 import re
 from datetime import datetime, date, time, timedelta
@@ -339,4 +343,36 @@ def write_booking(booking_data: Dict[str, Any], approved_by: str) -> Dict[str, A
         "message": f"Booking staged & validated under coordinator approval: '{approved_by}'",
         "approved_by": approved_by,
         "booking_data": booking_data
+    }
+
+
+# =========================================================================
+# WEEK 3 EXTENSION: 2-3 SLOT PROPOSAL CONVENIENCE WRAPPER
+# =========================================================================
+
+def suggest_slots_for_request(
+    role: str = "Doctor",
+    date_val: Optional[str] = None,
+    specialty: Optional[str] = None,
+    area: Optional[str] = None,
+    preferred_slot: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Week 3 Deliverable: High-level helper specifically designed to return 2-3
+    conflict-free time slots for a visit request rather than a simple binary yes/no.
+    Wraps propose_slot() to provide structured slot recommendations.
+    """
+    candidates = propose_slot(
+        role=role,
+        specialty=specialty,
+        date=date_val,
+        area=area,
+        slot=preferred_slot
+    )
+    return {
+        "milestone": "Week 3",
+        "date": date_val,
+        "role": role,
+        "total_available": len(candidates),
+        "candidates": candidates
     }

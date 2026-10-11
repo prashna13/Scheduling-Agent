@@ -12,6 +12,7 @@ from calendar_engine import (
     get_available_windows,
     load_sheet,
     get_staff_registry,
+    suggest_slots_for_request,
     _SHEET_CACHE
 )
 from langchain_agent import (
@@ -195,3 +196,24 @@ def test_conversational_with_chat_history():
     ]
     ans = ask_agent("Is Dr. Iyer free on 2026-09-28?", chat_history=history)
     assert "available" in ans.lower() or "free" in ans.lower()
+
+# ==========================================
+# 7. WEEK 3 MILESTONE: 2-3 SLOT PROPOSAL TESTS
+# ==========================================
+
+def test_week3_slot_suggestion_engine():
+    """Week 3 Requirement: Agent suggests 2-3 good time slots for a request, not just yes/no."""
+    # 1. Doctor slot proposals on Thursday 2026-10-15
+    res_doc = suggest_slots_for_request(role="Doctor", date_val="2026-10-15")
+    assert res_doc["milestone"] == "Week 3"
+    assert res_doc["total_available"] >= 1
+    for cand in res_doc["candidates"]:
+        assert "proposed_slots" in cand
+        assert 1 <= len(cand["proposed_slots"]) <= 3
+
+    # 2. Nurse slot proposals on Thursday 2026-09-24
+    res_nurse = suggest_slots_for_request(role="Nurse", date_val="2026-09-24")
+    assert res_nurse["total_available"] >= 1
+    for cand in res_nurse["candidates"]:
+        assert "proposed_slots" in cand
+        assert 1 <= len(cand["proposed_slots"]) <= 3

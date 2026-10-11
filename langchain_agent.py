@@ -11,6 +11,8 @@ Model Configuration:
 - Secondary: Google Gemini (gemini-2.5-flash)
 - Fallback: Deterministic 4-tool conversational engine
 """
+__version__ = "0.3.0"
+__milestone__ = "Week 3: Slot Suggestion Engine"
 
 import os
 import re
