@@ -415,14 +415,18 @@ def fallback_answer_query(query: str) -> str:
         name_match = re.search(r'\b(Dr\.?|Doctor|Nurse)\s+([A-Za-z]+(?:\s+[A-Za-z]+)?)\b', query, re.I)
         if name_match:
             cand_name = name_match.group(0).strip()
-            is_known = any(
-                s_name.lower() in cand_name.lower() or 
-                cand_name.lower() in s_name.lower() or 
-                s_name.split()[-1].lower() in cand_name.lower()
-                for s_name, _, _ in staff_registry
-            )
-            if not is_known:
-                unknown_staff_name = cand_name
+            cand_words = [w.lower() for w in name_match.group(2).split()]
+            stop_words = {'available', 'free', 'on', 'duty', 'scheduled', 'there', 'who', 'someone', 'anyone', 'visit', 'appointment', 'work', 'working'}
+            # Only treat as unknown staff if none of the candidate words are inquiry stopwords
+            if not any(w in stop_words for w in cand_words):
+                is_known = any(
+                    s_name.lower() in cand_name.lower() or 
+                    cand_name.lower() in s_name.lower() or 
+                    s_name.split()[-1].lower() in cand_name.lower()
+                    for s_name, _, _ in staff_registry
+                )
+                if not is_known:
+                    unknown_staff_name = cand_name
 
     # SCENARIO 1: Checking specific registered staff on date
     if target_staff and target_date:
