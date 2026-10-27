@@ -97,3 +97,7 @@ $RECYCLE.BIN/
 scratch/
 tmp/
 *.zip
+
+# Runtime staged booking drafts
+data/staged_drafts.json
+agent.md

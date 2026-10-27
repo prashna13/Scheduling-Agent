@@ -135,17 +135,106 @@ def test_propose_slot_with_specialty_and_area():
         assert "andheri" in c["service_area"].lower() or "mumbai" in c["service_area"].lower()
 
 # ==========================================
-# 5. TOOL 4: write_booking TESTS
+# 5. TOOL 4: write_booking & STAGING TESTS
 # ==========================================
 
-def test_write_booking_validation():
-    # Missing approved_by should raise ValueError
+def test_write_booking_validation(tmp_path):
+    import shutil
+    from calendar_engine import EXCEL_PATH, get_next_booking_id
+    temp_excel = str(tmp_path / "test_calendar.xlsx")
+    shutil.copyfile(EXCEL_PATH, temp_excel)
+
+    # Test 1: Missing approved_by should raise ValueError
     with pytest.raises(ValueError, match="CRITICAL SECURITY ERROR"):
-        write_booking(booking_data={"Patient": "Test"}, approved_by="")
-        
-    res = write_booking(booking_data={"Patient": "Test"}, approved_by="Coordinator_Prashna")
+        write_booking(booking_data={"patient_name": "Test"}, approved_by="", excel_path=temp_excel)
+
+    # Test 2: Valid coordinator approval generates sequential ID (e.g. BK-113) and writes to Excel
+    expected_next_id = get_next_booking_id(excel_path=temp_excel)
+    booking_payload = {
+        "patient_name": "Mr. Vinod Kulkarni",
+        "contact_number": "+91 90xxxxxx14",
+        "date": "2026-10-13",
+        "time_slot": "2:00 PM - 3:00 PM",
+        "assigned_staff": "Dr. Priya Nair",
+        "staff_role": "Doctor",
+        "service_type": "Geriatric consult",
+        "address_area": "Ghatkopar",
+        "status": "Confirmed",
+        "notes": "Follow-up visit"
+    }
+    # Verify slot is initially conflict-free
+    assert check_conflict(staff_id="DR-02", slot="2:00 PM - 3:00 PM", date="2026-10-13", excel_path=temp_excel) is False
+
+    res = write_booking(booking_data=booking_payload, approved_by="Coordinator_Prashna", excel_path=temp_excel)
     assert res["status"] == "success"
     assert res["approved_by"] == "Coordinator_Prashna"
+    assert res["booking_id"] == expected_next_id
+
+    # Test 3: Immediate subsequent check_conflict call on that slot returns True (conflict found)
+    assert check_conflict(staff_id="DR-02", slot="2:00 PM - 3:00 PM", date="2026-10-13", excel_path=temp_excel) is True
+
+    # Test 4: TOCTOU Double-Booking Guard blocks duplicate write_booking on the same slot
+    with pytest.raises(ValueError, match="CONFLICT ERROR"):
+        write_booking(booking_data=booking_payload, approved_by="Coordinator_Prashna", excel_path=temp_excel)
+
+    # Test 5: Title-Case keys from main.py CLI caller are normalized and written to Excel
+    main_cli_payload = {
+        "Date": "2026-10-13",
+        "Time Slot": "3:00 PM - 4:00 PM",
+        "Patient Name": "Mrs. Asha Deshmukh",
+        "Service Type": "Geriatric consult",
+        "Assigned Staff": "Dr. Priya Nair",
+        "Staff Role": "Doctor",
+        "Contact Number": "+91 9820112233",
+        "Address / Area": "Powai"
+    }
+    res_cli = write_booking(main_cli_payload, approved_by="Coordinator_Prashna", excel_path=temp_excel)
+    assert res_cli["booking_id"].startswith("BK-")
+    assert check_conflict(staff_id="DR-02", slot="3:00 PM - 4:00 PM", date="2026-10-13", excel_path=temp_excel) is True
+
+def test_conversational_draft_staging_and_multiturn():
+    import os
+    from calendar_engine import get_staged_drafts, _STAGED_DRAFTS, STAGED_DRAFTS_PATH, _save_drafts_to_disk
+    from langchain_agent import fallback_answer_query
+    _STAGED_DRAFTS.clear()
+    _save_drafts_to_disk()
+
+    # Step A: Booking request WITHOUT patient details asks the patient for required Excel fields first
+    q1 = "Can I book Dr. Priya Nair on Tuesday, 13-Oct-2026, from 2:00 PM to 3:00 PM?"
+    reply1 = fallback_answer_query(q1)
+    assert "awaiting patient intake details" in reply1.lower()
+    assert "patient full name" in reply1.lower()
+    assert "contact number" in reply1.lower()
+    assert "address / area" in reply1.lower()
+    assert "service type" in reply1.lower()
+    assert len(get_staged_drafts()) == 0
+
+    # Step B: Patient replies with lowercase name & 10-digit phone -> Normalized & staged to JSON disk
+    history = [
+        {"role": "user", "content": q1},
+        {"role": "assistant", "content": reply1}
+    ]
+    reply2 = fallback_answer_query(
+        "rahul sharma, 9876543210, ghatkopar, geriatric consult",
+        chat_history=history
+    )
+    assert "prepared your appointment draft" in reply2.lower()
+    assert os.path.exists(STAGED_DRAFTS_PATH)
+    drafts = get_staged_drafts()
+    assert len(drafts) == 1
+    assert drafts[0]["patient_name"] == "Rahul Sharma"
+    assert drafts[0]["contact_number"] == "+91 9876543210"
+    assert drafts[0]["address_area"] == "Ghatkopar"
+    assert drafts[0]["service_type"] == "geriatric consult"
+    assert drafts[0]["assigned_staff"] == "Dr. Priya Nair"
+    assert drafts[0]["date"] == "2026-10-13"
+    assert drafts[0]["time_slot"] == "2:00 PM - 3:00 PM"
+
+    # Step C: Mid-intake cancellation cleanly exits the booking flow
+    reply_cancel = fallback_answer_query("never mind, cancel", chat_history=history)
+    assert "cancelled the current booking draft" in reply_cancel.lower()
+    _STAGED_DRAFTS.clear()
+    _save_drafts_to_disk()
 
 # ==========================================
 # 6. LANGCHAIN & CONVERSATIONAL TESTS
