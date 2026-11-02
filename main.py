@@ -7,6 +7,7 @@ Uses strictly the 4 core calendar tools:
 4. write_booking
 """
 
+import os
 import sys
 import json
 from calendar_engine import (
@@ -14,6 +15,7 @@ from calendar_engine import (
     check_conflict,
     propose_slot,
     write_booking,
+    verify_coordinator_approval,
     load_sheet
 )
 from langchain_agent import ask_agent
@@ -81,9 +83,16 @@ def ask_tool_3_propose_slot():
 
 def ask_tool_4_write_booking():
     print("\n--- Tool 4: write_booking (HITL Validation Gate) ---")
-    approved_by = input("Enter Coordinator ID for Human Approval: ").strip()
-    if not approved_by:
-        print("Write halted: approved_by coordinator ID is required.")
+    approved_by = input("Enter Authorized Coordinator ID (e.g., Coordinator_Prashna): ").strip()
+    coord_pw = input("Enter Coordinator Password: ").strip()
+    expected_pw = (os.getenv("COORDINATOR_PASSWORD") or os.getenv("COORDINATOR_PIN") or "").strip()
+    if not approved_by or not expected_pw or coord_pw != expected_pw:
+        print("Write halted: valid Coordinator ID and COORDINATOR_PASSWORD are required.")
+        return
+    try:
+        approved_by = verify_coordinator_approval(approved_by)
+    except ValueError as e:
+        print(f"Write halted: {e}")
         return
         
     patient = input("Patient Name: ").strip()

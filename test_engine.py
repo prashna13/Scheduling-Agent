@@ -230,11 +230,120 @@ def test_conversational_draft_staging_and_multiturn():
     assert drafts[0]["date"] == "2026-10-13"
     assert drafts[0]["time_slot"] == "2:00 PM - 3:00 PM"
 
-    # Step C: Mid-intake cancellation cleanly exits the booking flow
+    # Step C: Cancellation dismisses the actual staged draft for this session
     reply_cancel = fallback_answer_query("never mind, cancel", chat_history=history)
-    assert "cancelled the current booking draft" in reply_cancel.lower()
+    assert "cancelled and removed your staged booking draft" in reply_cancel.lower()
+    assert len(get_staged_drafts()) == 0
+
+    # Step D: Availability inquiry with a specific slot ("is dr iyer free on 2nd october 9am-10am?")
+    # followed by comma-separated intake ("reema dahal,98413245678,bandra,checkup") stages a real draft
+    q_iyer = "is dr iyer free on 2nd october 9am-10am?"
+    r_iyer1 = fallback_answer_query(q_iyer, session_id="reema_sess")
+    r_iyer2 = fallback_answer_query(
+        "reema dahal,98413245678,bandra,checkup",
+        chat_history=[{"role": "user", "content": q_iyer}, {"role": "assistant", "content": r_iyer1}],
+        session_id="reema_sess"
+    )
+    assert "staged appointment draft" in r_iyer2.lower()
+    assert len(get_staged_drafts(session_id="reema_sess")) == 1
+    assert get_staged_drafts(session_id="reema_sess")[0]["patient_name"] == "Reema Dahal"
+
+    # Step E: Asking for the same time again for another patient stages a second distinct draft
+    fallback_answer_query(q_iyer, session_id="reema_sess")
+    r_iyer3 = fallback_answer_query(
+        "anil kapoor,9820112233,bandra,checkup",
+        session_id="reema_sess"
+    )
+    assert "staged appointment draft" in r_iyer3.lower()
+    assert len(get_staged_drafts(session_id="reema_sess")) == 2
     _STAGED_DRAFTS.clear()
     _save_drafts_to_disk()
+
+
+def test_edge_cases_security_and_correctness(tmp_path, monkeypatch):
+    import shutil
+    from concurrent.futures import ThreadPoolExecutor
+    import calendar_engine
+    from calendar_engine import EXCEL_PATH, get_staged_drafts, stage_booking_draft, _STAGED_DRAFTS
+    from langchain_agent import fallback_answer_query, _ACTIVE_INTAKE_STATE
+
+    temp_excel = str(tmp_path / "edge_calendar.xlsx")
+    shutil.copyfile(EXCEL_PATH, temp_excel)
+
+    valid_payload = {
+        "patient_name": "Mr. Vinod Kulkarni",
+        "contact_number": "+91 9012345614",
+        "date": "2026-10-13",
+        "time_slot": "2:00 PM - 3:00 PM",
+        "assigned_staff": "Dr. Priya Nair",
+        "staff_role": "Doctor",
+        "service_type": "Geriatric consult",
+        "address_area": "Ghatkopar"
+    }
+
+    # 1. Unauthenticated / Unauthorized coordinator label rejected at write boundary
+    with pytest.raises(ValueError, match="CRITICAL SECURITY ERROR"):
+        write_booking(valid_payload, approved_by="Unverified_Caller", excel_path=temp_excel)
+
+    # 2. Missing schedule fields rejected instead of silently skipping Excel write & returning success
+    with pytest.raises(ValueError, match="MISSING SCHEDULE FIELDS"):
+        write_booking({"patient_name": "Incomplete Patient"}, approved_by="Coordinator_Prashna", excel_path=temp_excel)
+
+    # 3. Missing Excel workbook raises FileNotFoundError instead of reporting fake success
+    with pytest.raises(FileNotFoundError, match="not found"):
+        write_booking(valid_payload, approved_by="Coordinator_Prashna", excel_path=str(tmp_path / "nonexistent.xlsx"))
+
+    # 4. Ambiguous staff name ("Nurse" or "Dr.") raises ValueError instead of picking first row (.iloc[0])
+    with pytest.raises(ValueError, match="AMBIGUOUS STAFF IDENTIFIER"):
+        check_conflict(staff_id="Nurse", slot="10:00 AM - 11:00 AM", date="2026-09-24", excel_path=temp_excel)
+
+    # 5. Failed draft persistence raises IOError instead of silently ignoring disk failure
+    bad_draft_path = str(tmp_path / "nonexistent_dir_xyz" / "sub" / "\0invalid.json")
+    monkeypatch.setattr(calendar_engine, "STAGED_DRAFTS_PATH", bad_draft_path)
+    with pytest.raises(IOError, match="DRAFT PERSISTENCE ERROR"):
+        stage_booking_draft(valid_payload, persist_draft=True)
+    monkeypatch.undo()
+
+    # 6. Emergency clinical escalation route intercepts medical emergencies immediately
+    emerg_reply = ask_agent("My father has severe chest pain and difficulty breathing right now")
+    assert "URGENT MEDICAL ESCALATION" in emerg_reply
+    assert "108" in emerg_reply or "112" in emerg_reply
+
+    # 7. Explicit session state tracking (independent of assistant message copy & isolated per session)
+    _STAGED_DRAFTS.clear()
+    _ACTIVE_INTAKE_STATE.clear()
+    fallback_answer_query("Can I book Dr. Priya Nair on 13-Oct-2026 from 2:00 PM to 3:00 PM?", session_id="patient_A")
+    assert "patient_A" in _ACTIVE_INTAKE_STATE
+    assert "patient_B" not in _ACTIVE_INTAKE_STATE
+
+    # Even with empty chat_history (no prior assistant text), explicit state completes patient_A's booking
+    reply_a = fallback_answer_query(
+        "Rahul Sharma, 9876543210, Ghatkopar, Geriatric consult",
+        chat_history=[],
+        session_id="patient_A"
+    )
+    assert "prepared your appointment draft" in reply_a.lower()
+    assert len(get_staged_drafts(session_id="patient_A")) == 1
+    assert len(get_staged_drafts(session_id="patient_B")) == 0
+    _STAGED_DRAFTS.clear()
+
+    # 8. Concurrent write_booking calls: exactly 1 succeeds and 1 fails with CONFLICT ERROR
+    def attempt_write(_):
+        return write_booking(valid_payload, approved_by="Coordinator_Prashna", excel_path=temp_excel)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(attempt_write, i) for i in range(2)]
+        outcomes = []
+        for f in futures:
+            try:
+                outcomes.append(("ok", f.result()))
+            except Exception as exc:
+                outcomes.append(("err", str(exc)))
+
+    successes = [o for o in outcomes if o[0] == "ok"]
+    errors = [o for o in outcomes if o[0] == "err" and "CONFLICT ERROR" in o[1]]
+    assert len(successes) == 1
+    assert len(errors) == 1
 
 # ==========================================
 # 6. LANGCHAIN & CONVERSATIONAL TESTS

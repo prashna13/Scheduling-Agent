@@ -7,12 +7,14 @@ Single source of truth: Excel calendar database.
 """
 
 import os
+import uuid
 import streamlit as st
 from langchain_agent import ask_agent
 from calendar_engine import (
     get_staged_drafts,
     dismiss_staged_draft,
     write_booking,
+    verify_coordinator_approval,
     load_sheet
 )
 
@@ -108,7 +110,10 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# Initialize Chat History
+# Initialize Per-Session Identifier & Chat History
+if "session_id" not in st.session_state:
+    st.session_state["session_id"] = f"sess_{uuid.uuid4().hex[:8]}"
+
 if "messages" not in st.session_state:
     st.session_state["messages"] = [
         {
@@ -122,7 +127,8 @@ if "messages" not in st.session_state:
         }
     ]
 
-# Fetch currently staged drafts for the Coordinator Review tab badge
+# Fetch currently staged drafts (scoped per session for patient tab, global for Coordinator Review)
+session_drafts = get_staged_drafts(session_id=st.session_state["session_id"])
 staged_drafts = get_staged_drafts()
 draft_count = len(staged_drafts)
 
@@ -163,10 +169,12 @@ with tab_chat:
     elif btn4:
         selected_prompt = "Is any nurse free on 2026-09-21?"
 
-    if draft_count > 0:
+    st.caption("🔒 *Demo Mode Notice: Please use synthetic patient names and contact details during intake.*")
+
+    if len(session_drafts) > 0:
         st.info(
-            f"📋 **{draft_count} appointment draft(s)** staged and awaiting confirmation. "
-            f"Switch to the **🛡️ Coordinator Review ({draft_count})** tab above to approve and write to the calendar."
+            f"📋 **{len(session_drafts)} appointment draft(s)** from your session staged and awaiting confirmation. "
+            f"Coordinators can approve them in the **🛡️ Coordinator Review ({draft_count})** tab above."
         )
 
     st.markdown("---")
@@ -189,30 +197,36 @@ with tab_chat:
 # TAB 2: 🔐 COORDINATOR LOGIN & REVIEW (Password-Protected HITL Gate)
 # ===========================================================================
 with tab_coord:
-    expected_pw = os.getenv("COORDINATOR_PASSWORD") or os.getenv("COORDINATOR_PIN") or "saathi123"
+    expected_pw = (os.getenv("COORDINATOR_PASSWORD") or os.getenv("COORDINATOR_PIN") or "").strip()
 
     if not st.session_state.get("coord_authenticated", False):
         st.markdown("### 🔐 Coordinator Portal Login")
-        st.markdown("Authorized care coordinators only. Enter your credentials to review and approve staged bookings.")
+        st.markdown("Authorized care coordinators only. Enter your registered Coordinator ID and password to review and approve staged bookings.")
+        if not expected_pw:
+            st.warning("⚠️ `COORDINATOR_PASSWORD` is not configured in `.env`. Coordinator login is disabled until set.")
         with st.container(border=True):
             login_id = st.text_input(
-                "Coordinator ID / Name",
+                "Authorized Coordinator ID",
                 value=st.session_state.get("coord_name", "Coordinator_Prashna"),
                 key="login_coord_id"
             )
             login_pw = st.text_input(
                 "Coordinator Password",
                 type="password",
-                placeholder="Enter password (default: saathi123)",
+                placeholder="Enter COORDINATOR_PASSWORD from .env",
                 key="login_coord_pw"
             )
-            if st.button("🔐 Login to Coordinator Portal", use_container_width=True):
-                if login_id.strip() and login_pw == expected_pw:
-                    st.session_state["coord_authenticated"] = True
-                    st.session_state["coord_name"] = login_id.strip()
-                    st.rerun()
-                else:
-                    st.error("❌ Invalid Coordinator ID or Password.")
+            if st.button("🔐 Login to Coordinator Portal", use_container_width=True, disabled=not expected_pw):
+                try:
+                    verified_id = verify_coordinator_approval(login_id)
+                    if expected_pw and login_pw == expected_pw:
+                        st.session_state["coord_authenticated"] = True
+                        st.session_state["coord_name"] = verified_id
+                        st.rerun()
+                    else:
+                        st.error("❌ Invalid Coordinator Password.")
+                except ValueError as auth_err:
+                    st.error(f"❌ {auth_err}")
     else:
         coord_name = st.session_state.get("coord_name", "Coordinator_Prashna")
         hdr_col1, hdr_col2, hdr_col3 = st.columns([3, 1, 1])
@@ -331,7 +345,8 @@ if user_input:
     st.session_state["messages"].append({"role": "user", "content": user_input})
     reply = ask_agent(
         user_query=user_input,
-        chat_history=st.session_state["messages"]
+        chat_history=st.session_state["messages"],
+        session_id=st.session_state["session_id"]
     )
     st.session_state["messages"].append({"role": "assistant", "content": reply})
     st.rerun()

@@ -209,6 +209,31 @@ def read_availability(
     return available_staff
 
 
+def _resolve_staff_row(avail_df: pd.DataFrame, staff_id: str) -> Optional[pd.Series]:
+    """Resolves a single staff row by exact Staff ID, exact full Name, or unambiguous name token."""
+    staff_clean = staff_id.strip().lower()
+    if not staff_clean:
+        return None
+    id_col = avail_df['Staff ID'].astype(str).str.strip().str.lower()
+    name_col = avail_df['Name'].astype(str).str.strip().str.lower()
+
+    exact = avail_df[(id_col == staff_clean) | (name_col == staff_clean)]
+    if len(exact) == 1:
+        return exact.iloc[0]
+    if len(exact) > 1:
+        raise ValueError(f"AMBIGUOUS STAFF IDENTIFIER: '{staff_id}' matches multiple staff records.")
+
+    target_core = re.sub(r'^(dr\.?|doctor|nurse)\s+', '', staff_clean).strip()
+    if not target_core:
+        raise ValueError(f"AMBIGUOUS STAFF IDENTIFIER: '{staff_id}' is a generic title without a name.")
+
+    token_pattern = rf'\b{re.escape(target_core)}\b'
+    matched = avail_df[name_col.str.contains(token_pattern, regex=True)]
+    if len(matched) > 1:
+        raise ValueError(f"AMBIGUOUS STAFF IDENTIFIER: '{staff_id}' matches multiple staff members.")
+    return matched.iloc[0] if len(matched) == 1 else None
+
+
 # TOOL 2: check_conflict
 def check_conflict(
     staff_id: str,
@@ -227,22 +252,14 @@ def check_conflict(
     
     day_name = target_date.strftime("%a")
     
-    # 1. Verify shift hours in Staff Availability
+    # 1. Verify shift hours in Staff Availability (unambiguous match)
     avail_df = load_sheet("Staff Availability", excel_path=excel_path)
-    staff_clean = staff_id.strip().lower()
-    target_core = re.sub(r'^(dr\.?|doctor|nurse)\s+', '', staff_clean).strip()
-    
-    matched = avail_df[
-        (avail_df['Staff ID'].astype(str).str.strip().str.lower() == staff_clean) |
-        (avail_df['Name'].astype(str).str.strip().str.lower() == staff_clean) |
-        (avail_df['Name'].astype(str).str.strip().str.lower().str.contains(target_core, regex=False))
-    ]
-    
-    if matched.empty:
+    staff_row = _resolve_staff_row(avail_df, staff_id)
+    if staff_row is None:
         return True
         
-    staff_row = matched.iloc[0]
-    staff_name = str(staff_row.get('Name', ''))
+    staff_name = str(staff_row.get('Name', '')).strip()
+    resolved_id = str(staff_row.get('Staff ID', '')).strip().lower()
     shift = str(staff_row.get(day_name, 'Off')).strip()
     
     if shift.lower() == 'off' or pd.isna(shift):
@@ -251,7 +268,7 @@ def check_conflict(
     if slot and not is_time_within_window(slot, shift):
         return True
         
-    # 2. Check active bookings in Bookings Calendar
+    # 2. Check active bookings in Bookings Calendar using exact resolved staff name or ID
     bookings_df = load_sheet("Bookings Calendar", excel_path=excel_path)
     bookings_df['ParsedDate'] = bookings_df['Date'].apply(parse_date)
     
@@ -261,11 +278,7 @@ def check_conflict(
     day_bookings = bookings_df[
         (bookings_df['ParsedDate'] == target_date) &
         (status_col != 'cancelled') &
-        (
-            (assigned_col == staff_name.strip().lower()) |
-            (assigned_col == staff_clean) |
-            (assigned_col.str.contains(target_core, regex=False))
-        )
+        ((assigned_col == staff_name.lower()) | (assigned_col == resolved_id))
     ]
     
     for _, b in day_bookings.iterrows():
@@ -316,18 +329,14 @@ def propose_slot(
             if check_conflict(staff_id=staff['staff_id'], slot=slot, date=date, excel_path=excel_path):
                 continue
                 
-        # Calculate available open 1-hour slots
-        staff_name = staff['name']
-        target_core = re.sub(r'^(dr\.?|doctor|nurse)\s+', '', staff_name.strip().lower()).strip()
+        # Calculate available open 1-hour slots using exact staff name or ID
+        staff_name = staff['name'].strip().lower()
+        staff_id_low = staff['staff_id'].strip().lower()
         assigned_col = bookings_df['Assigned Staff'].astype(str).str.strip().str.lower()
         day_bookings = bookings_df[
             (bookings_df['ParsedDate'] == target_date) &
             (bookings_df['Status'].astype(str).str.lower() != 'cancelled') &
-            (
-                (assigned_col == staff_name.strip().lower()) |
-                (assigned_col == staff['staff_id'].strip().lower()) |
-                (assigned_col.str.contains(target_core, regex=False))
-            )
+            ((assigned_col == staff_name) | (assigned_col == staff_id_low))
         ]
         booked_slots = [str(b['Time Slot']).strip() for _, b in day_bookings.iterrows()]
         open_slots = get_available_windows(staff['working_hours'], booked_slots)
@@ -353,16 +362,29 @@ _BOOKING_LOCK = threading.RLock()
 STAGED_DRAFTS_PATH = os.path.join("data", "staged_drafts.json")
 _STAGED_DRAFTS: List[Dict[str, Any]] = []
 _DRAFT_COUNTER: int = 0
+DEFAULT_AUTHORIZED_COORDINATORS = {"coordinator_prashna", "coordinator_admin", "coordinator_sneha"}
+
+
+def verify_coordinator_approval(approved_by: str) -> str:
+    """Validates coordinator identity at the write boundary against AUTHORIZED_COORDINATORS."""
+    if not approved_by or not isinstance(approved_by, str) or not approved_by.strip():
+        raise ValueError("CRITICAL SECURITY ERROR: write_booking requires an explicit 'approved_by' identifier.")
+    clean = approved_by.strip()
+    raw_allowed = os.getenv("AUTHORIZED_COORDINATORS", "")
+    allowed = {c.strip().lower() for c in raw_allowed.split(",") if c.strip()} or DEFAULT_AUTHORIZED_COORDINATORS
+    if clean.lower() not in allowed:
+        raise ValueError(f"CRITICAL SECURITY ERROR: Unauthorized coordinator '{clean}'.")
+    return clean
 
 
 def _save_drafts_to_disk() -> None:
-    """Persists _STAGED_DRAFTS to disk so pending drafts survive restarts."""
+    """Persists _STAGED_DRAFTS to disk and raises IOError if persistence fails."""
     try:
         os.makedirs(os.path.dirname(STAGED_DRAFTS_PATH), exist_ok=True)
         with open(STAGED_DRAFTS_PATH, "w", encoding="utf-8") as f:
             json.dump({"counter": _DRAFT_COUNTER, "drafts": _STAGED_DRAFTS}, f, indent=2)
-    except Exception:
-        pass
+    except Exception as exc:
+        raise IOError(f"DRAFT PERSISTENCE ERROR: Could not persist staged drafts to {STAGED_DRAFTS_PATH}: {exc}") from exc
 
 
 def _load_drafts_from_disk() -> None:
@@ -375,7 +397,7 @@ def _load_drafts_from_disk() -> None:
                 _STAGED_DRAFTS = data.get("drafts", [])
                 _DRAFT_COUNTER = int(data.get("counter", len(_STAGED_DRAFTS)))
         except Exception:
-            pass
+            _STAGED_DRAFTS = []
 
 
 _load_drafts_from_disk()
@@ -394,6 +416,7 @@ def normalize_booking_contract(booking_data: Dict[str, Any]) -> Dict[str, Any]:
     norm_date = b_date.strftime("%Y-%m-%d") if b_date else str(raw_date or "").strip()
 
     return {
+        "session_id": str(booking_data.get("session_id") or "default").strip(),
         "patient_name": str(booking_data.get("patient_name") or booking_data.get("Patient Name") or booking_data.get("Patient") or "Patient Inquiry").strip(),
         "contact_number": str(booking_data.get("contact_number") or booking_data.get("Contact Number") or "+91 90xxxxxx00").strip(),
         "date": norm_date,
@@ -420,9 +443,11 @@ def stage_booking_draft(booking_data: Dict[str, Any], persist_draft: bool = True
         if persist_draft:
             for existing in _STAGED_DRAFTS:
                 if (
-                    existing.get("date") == contract["date"]
+                    existing.get("session_id", "default") == contract["session_id"]
+                    and existing.get("date") == contract["date"]
                     and existing.get("time_slot") == contract["time_slot"]
                     and existing.get("assigned_staff", "").lower() == contract["assigned_staff"].lower()
+                    and existing.get("patient_name", "").lower() == contract["patient_name"].lower()
                 ):
                     for key in ("patient_name", "contact_number", "service_type", "address_area", "notes"):
                         if contract.get(key):
@@ -440,14 +465,16 @@ def stage_booking_draft(booking_data: Dict[str, Any], persist_draft: bool = True
     return contract
 
 
-def get_staged_drafts() -> List[Dict[str, Any]]:
-    """Returns all staged booking drafts currently awaiting coordinator authorization."""
+def get_staged_drafts(session_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Returns staged booking drafts (filtered by session_id when provided)."""
     with _BOOKING_LOCK:
+        if session_id:
+            return [dict(d) for d in _STAGED_DRAFTS if d.get("session_id", "default") == session_id]
         return [dict(d) for d in _STAGED_DRAFTS]
 
 
 def dismiss_staged_draft(draft_id: str) -> bool:
-    """Removes a staged booking draft when rejected or dismissed by a coordinator."""
+    """Removes a staged booking draft when rejected or dismissed by a coordinator or cancelled by user."""
     global _STAGED_DRAFTS
     with _BOOKING_LOCK:
         before = len(_STAGED_DRAFTS)
@@ -485,98 +512,99 @@ def write_booking(
 ) -> Dict[str, Any]:
     """
     TOOL 4 (HITL Action): Human-in-the-loop coordinator approval gate.
-    Validates the booking proposal, re-verifies no conflict exists (TOCTOU guard),
-    acquires a thread lock, appends the row to Excel, and invalidates _SHEET_CACHE.
+    Authenticates coordinator at the write boundary, validates required schedule fields
+    and workbook existence, re-verifies no conflict exists (TOCTOU guard) under a thread lock,
+    appends the row to Excel, and returns success ONLY after the write succeeds.
     """
     global _STAGED_DRAFTS
-    if not approved_by or not isinstance(approved_by, str) or not approved_by.strip():
-        raise ValueError("CRITICAL SECURITY ERROR: write_booking requires an explicit 'approved_by' identifier.")
-
-    clean_approver = approved_by.strip()
+    clean_approver = verify_coordinator_approval(approved_by)
     contract = normalize_booking_contract(booking_data)
     booking_id = booking_data.get("booking_id")
 
-    has_schedule_fields = bool(contract["date"] and contract["time_slot"] and contract["assigned_staff"])
+    if not (contract["date"] and contract["time_slot"] and contract["assigned_staff"]):
+        raise ValueError(
+            "MISSING SCHEDULE FIELDS: 'date', 'time_slot', and 'assigned_staff' are required to write a booking."
+        )
 
-    if has_schedule_fields and os.path.exists(excel_path):
-        import openpyxl
-        with _BOOKING_LOCK:
-            # Improvement 1: TOCTOU Conflict Re-Check right before committing to Excel
-            if check_conflict(
-                staff_id=contract["assigned_staff"],
-                slot=contract["time_slot"],
-                date=contract["date"],
-                excel_path=excel_path
-            ):
-                raise ValueError(
-                    f"CONFLICT ERROR: {contract['assigned_staff']} is already booked or unavailable on "
-                    f"{contract['date']} for {contract['time_slot']}."
-                )
+    if not os.path.exists(excel_path):
+        raise FileNotFoundError(f"Database file not found at {excel_path}")
 
-            wb = openpyxl.load_workbook(excel_path)
-            ws = wb["Bookings Calendar"]
+    import openpyxl
+    with _BOOKING_LOCK:
+        # TOCTOU Conflict Re-Check right before committing to Excel
+        if check_conflict(
+            staff_id=contract["assigned_staff"],
+            slot=contract["time_slot"],
+            date=contract["date"],
+            excel_path=excel_path
+        ):
+            raise ValueError(
+                f"CONFLICT ERROR: {contract['assigned_staff']} is already booked or unavailable on "
+                f"{contract['date']} for {contract['time_slot']}."
+            )
 
-            if not booking_id:
-                booking_id = _next_bk_id_from_ws(ws)
+        wb = openpyxl.load_workbook(excel_path)
+        ws = wb["Bookings Calendar"]
 
-            b_date = parse_date(contract["date"])
-            date_val = datetime.combine(b_date, time(0, 0)) if b_date else contract["date"]
+        if not booking_id:
+            booking_id = _next_bk_id_from_ws(ws)
 
-            base_notes = contract["notes"]
-            approval_note = f"Approved by {clean_approver}"
-            final_notes = f"{base_notes} | {approval_note}" if base_notes else approval_note
+        b_date = parse_date(contract["date"])
+        date_val = datetime.combine(b_date, time(0, 0)) if b_date else contract["date"]
 
-            last_row_idx = 5
-            for idx, row in enumerate(ws.iter_rows(min_row=5, values_only=True), start=5):
-                if any(cell is not None and str(cell).strip() != "" for cell in row):
-                    last_row_idx = idx
-            target_row_idx = last_row_idx + 1
+        base_notes = contract["notes"]
+        approval_note = f"Approved by {clean_approver}"
+        final_notes = f"{base_notes} | {approval_note}" if base_notes else approval_note
 
-            new_row_values = [
-                booking_id,
-                date_val,
-                contract["time_slot"],
-                contract["patient_name"],
-                contract["service_type"],
-                contract["assigned_staff"],
-                contract["staff_role"],
-                "Confirmed",
-                contract["contact_number"],
-                contract["address_area"],
-                final_notes
-            ]
+        last_row_idx = 5
+        for idx, row in enumerate(ws.iter_rows(min_row=5, values_only=True), start=5):
+            if any(cell is not None and str(cell).strip() != "" for cell in row):
+                last_row_idx = idx
+        target_row_idx = last_row_idx + 1
 
-            for col_idx, val in enumerate(new_row_values, start=1):
-                ws.cell(row=target_row_idx, column=col_idx, value=val)
+        new_row_values = [
+            booking_id,
+            date_val,
+            contract["time_slot"],
+            contract["patient_name"],
+            contract["service_type"],
+            contract["assigned_staff"],
+            contract["staff_role"],
+            "Confirmed",
+            contract["contact_number"],
+            contract["address_area"],
+            final_notes
+        ]
 
-            # Improvement 2: Graceful PermissionError handling if Excel is open on desktop
-            try:
-                wb.save(excel_path)
-            except PermissionError as exc:
-                wb.close()
-                raise PermissionError(
-                    "EXCEL FILE LOCKED: Please close the Excel calendar file in Microsoft Excel and try again."
-                ) from exc
+        for col_idx, val in enumerate(new_row_values, start=1):
+            ws.cell(row=target_row_idx, column=col_idx, value=val)
 
-            _SHEET_CACHE.clear()
+        try:
+            wb.save(excel_path)
+        except PermissionError as exc:
+            wb.close()
+            raise PermissionError(
+                "EXCEL FILE LOCKED: Please close the Excel calendar file in Microsoft Excel and try again."
+            ) from exc
 
-            # Remove this draft and any overlapping drafts for the same staff/date/slot
-            draft_id = booking_data.get("draft_id")
-            _STAGED_DRAFTS = [
-                d for d in _STAGED_DRAFTS
-                if d.get("draft_id") != draft_id
-                and not (
-                    d.get("date") == contract["date"]
-                    and d.get("assigned_staff", "").lower() == contract["assigned_staff"].lower()
-                    and times_overlap(d.get("time_slot", ""), contract["time_slot"])
-                )
-            ]
-            _save_drafts_to_disk()
+        _SHEET_CACHE.clear()
+
+        draft_id = booking_data.get("draft_id")
+        _STAGED_DRAFTS = [
+            d for d in _STAGED_DRAFTS
+            if d.get("draft_id") != draft_id
+            and not (
+                d.get("date") == contract["date"]
+                and d.get("assigned_staff", "").lower() == contract["assigned_staff"].lower()
+                and times_overlap(d.get("time_slot", ""), contract["time_slot"])
+            )
+        ]
+        _save_drafts_to_disk()
 
     return {
         "status": "success",
-        "booking_id": booking_id or "STAGED",
-        "message": f"Booking {booking_id or 'proposal'} confirmed & written under coordinator approval: '{clean_approver}'",
+        "booking_id": booking_id,
+        "message": f"Booking {booking_id} confirmed & written under coordinator approval: '{clean_approver}'",
         "approved_by": clean_approver,
         "booking": contract,
         "booking_data": contract
