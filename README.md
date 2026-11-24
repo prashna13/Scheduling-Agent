@@ -1,73 +1,71 @@
-# Saathi Sneha Care - Scheduling Sub-Agent (Week 6)
+# Saathi Sneha Care — Scheduling Sub-Agent (v0.6.0)
 
-LangChain-based Scheduling Sub-Agent and Streamlit Web Application for Saathi Sneha Care.  
-This milestone delivers the complete **Week 6 Human-in-the-Loop (HITL) Booking Workflow**: multi-turn patient intake, persistent draft staging, a password-protected Coordinator Review Portal, and thread-safe Excel calendar persistence with automatic cache invalidation.
+LangChain-based Scheduling Sub-Agent and Streamlit Web Application for **Saathi Sneha Care** (Mumbai home healthcare visits).  
+Built across Weeks 1–8, this standalone sub-agent delivers an end-to-end **Human-in-the-Loop (HITL) Booking Workflow**: natural-language availability queries, 2–3 smart slot proposals, multi-turn patient intake, persistent draft staging, a password-protected Coordinator Review Portal, clinical emergency escalation, and thread-safe Excel persistence verified by **24/24 automated pytest tests**.
+
+> **Multi-Agent Integration Status (Week 5):** Standalone scheduling sub-agent ready for plug-and-play orchestration. Clean stateless entrypoints (`ask_agent(query, chat_history, session_id)` and `CORE_TOOLS`) are exported from `agent.py` to connect with the other two agents once the shared orchestrator is wired up.
 
 ---
 
-## Core Capabilities (Week 6 Milestone)
+## Core Capabilities
 
 1. **Human-in-the-Loop `write_booking` Engine & Excel Persistence:**  
-   When an authorized coordinator approves a staged draft, `write_booking` re-verifies slot availability (TOCTOU double-booking guard), generates the next sequential `Booking ID` (e.g., `BK-113`), appends the 11-column row to the `Bookings Calendar` sheet in `data/Saathi_Sneha_Care_Scheduling_Calendar_Mockup.xlsx`, invalidates the in-memory sheet cache, and dismisses any overlapping staged drafts.
+   The LLM never writes directly to Excel (`write_booking_tool` is excluded from `AGENT_READ_ONLY_TOOLS`). When an authorized coordinator approves a staged draft, `write_booking` acquires a `threading.RLock`, re-verifies slot availability (TOCTOU double-booking guard), generates the next sequential `Booking ID` (e.g., `BK-113`), appends the 11-column row to `Bookings Calendar` in `data/Saathi_Sneha_Care_Scheduling_Calendar_Mockup.xlsx` (preserving date formatting), clears the sheet cache, and auto-cancels any overlapping staged drafts.
 2. **Multi-Turn Patient Intake & Persistent Draft Staging:**  
-   Before staging a booking draft (`DRAFT-01`), the conversational engine prompts the patient for all required Excel fields (**Patient Full Name**, **Contact Number**, **Address / Area**, **Service Type**, and optional **Special Notes**). Supports single-turn or multi-turn replies, case-insensitive name/area formatting, 10-digit mobile number normalization (`+91 XXXXXXXXXX`), mid-intake cancellation, and JSON disk persistence (`data/staged_drafts.json`).
-3. **Password-Protected Coordinator Review Tab:**  
-   The Streamlit interface separates **Patient Chat** and **Coordinator Login / Review** into two distinct tabs. The coordinator tab is gated by `COORDINATOR_PASSWORD` (default: `saathi123`) and allows coordinators to inspect/edit draft fields, approve and write bookings to Excel, dismiss drafts, and view the live `Bookings Calendar`.
-4. **Intelligent 2-3 Slot Proposal Engine:**  
-   Evaluates active shifts and calendar bookings to compute and suggest 2-3 discrete, non-overlapping 1-hour appointment slots (e.g., `2:00 PM - 3:00 PM`, `3:00 PM - 4:00 PM`).
-5. **Smart Alternative Recommendations & Non-Existent Staff Handling:**  
-   When a requested doctor or nurse is unavailable (marked "Off" or booked) or not registered in the database (e.g., Dr. John Doe), the agent explains why and proposes available on-duty staff with their open 1-hour slots.
+   Before staging a booking draft (`DRAFT-01`), the agent collects all required Excel fields (**Patient Full Name**, **Contact Number**, **Address / Area**, **Service Type**, and optional **Special Notes**). Supports single-turn or multi-turn replies, 10-digit mobile number normalization (`+91 XXXXXXXXXX`), mid-intake cancellation, per-session isolation, and JSON disk persistence (`data/staged_drafts.json`).
+3. **Password-Protected Coordinator Review Portal:**  
+   The Streamlit app (`app.py`) separates **Patient Chat** (Tab 1) and **Coordinator Login / Review** (Tab 2). Authenticated coordinators (`COORDINATOR_PASSWORD`, default `saathi123`) can inspect/edit drafts, approve bookings to Excel, dismiss drafts, edit `Bookings Calendar`, view read-only `Staff Availability`, and download/re-upload `.xlsx` snapshots.
+4. **Intelligent 2–3 Slot Proposal Engine & Smart Alternatives:**  
+   Evaluates shifts and active bookings (including single-time entries like `11am` treated as 1-hour blocks) to propose 2–3 conflict-free 1-hour slots. Filters by role, specialty (e.g., Geriatric, Palliative), and Mumbai locality. When a clinician is Off, booked, or unregistered (e.g., *Dr. John Doe*), the agent explains why and suggests available on-duty staff.
+5. **3-Tier Hybrid Grounding Pipeline:**  
+   Runs deterministic Excel grounding first so availability facts, intake states, and safety responses can never be hallucinated, then uses **OpenRouter (`openai/gpt-oss-120b`) → Google Gemini (`gemini-2.5-flash`) → 100% offline deterministic fallback** for warm WhatsApp-style phrasing.
+6. **Clinical Emergency Bypass:**  
+   Detects acute symptom cues (e.g., chest pain, stroke, breathing difficulty) and immediately bypasses scheduling to instruct calling **108 / 112**.
 
 ---
 
 ## The 4 Core Tool Interfaces
 
-| Tool | Signature | Type | Description |
+| Tool | Signature | Access | Description |
 | :--- | :--- | :--- | :--- |
-| `read_availability` | `(date_range: str, role: str) -> List[Dict]` | Read-only | Returns all staff of a given role scheduled to work on the target date (excluding "Off" days). |
-| `check_conflict` | `(staff_id: str, slot: str, date: str) -> bool` | Read-only | Returns `True` if the requested slot overlaps an active booking or falls outside working hours. |
-| `propose_slot` | `(role, specialty, date, area, slot=None) -> List[Dict]` | Read-only | Evaluates working shifts and active bookings to propose 2-3 conflict-free 1-hour time slots. |
-| `write_booking` | `(booking_data: dict, approved_by: str) -> Dict` | Write Gate | Validates `approved_by`, re-checks conflicts under a thread lock, generates the next `BK-xxx` ID, appends the confirmed row to Excel, and clears the cache. |
+| `read_availability` | `(date_range: str, role: str) -> List[Dict]` | Read-only (LLM) | Returns all staff of a given role scheduled to work on the target date (excluding `"Off"` days). |
+| `check_conflict` | `(staff_id: str, slot: str, date: str) -> bool` | Read-only (LLM) | Returns `True` if the slot overlaps an active booking, falls outside shift hours, is on an off-day, or is in the past. |
+| `propose_slot` | `(role, specialty, date, area, slot=None) -> List[Dict]` | Read-only (LLM) | Evaluates working shifts and active bookings via `get_available_windows()` to propose 2–3 conflict-free 1-hour slots. |
+| `write_booking` | `(booking_data: dict, approved_by: str) -> Dict` | Write Gate (HITL) | Human-only. Verifies coordinator ID, acquires `RLock`, re-checks conflicts, appends `BK-xxx` to Excel, clears cache, and auto-cancels overlapping drafts. |
 
 ---
 
-## Example Interaction (Week 6 End-to-End Booking Flow)
+## Example Interaction (End-to-End HITL Booking Flow)
 
 ### Step 1: Patient Requests a Slot (Patient Intake Gate)
-* **User Query:** *"Can I book Dr. Priya Nair on Tuesday, 13-Oct-2026, from 2:00 PM to 3:00 PM?"*
-* **Agent Response:**  
-  *"Great news -- Dr. Priya Nair is available on Tuesday, October 13, 2026 for 2:00 PM - 3:00 PM. To prepare your appointment draft for our care coordinator and fill out the booking sheet, please provide the following missing details:*  
-  *1. Patient Full Name*  
-  *2. Contact Number*  
-  *3. Address / Area in Mumbai*  
-  *4. Service Type / Reason for Visit*  
-  *5. Special Notes (Optional)"*
+* **User Query:** *"Can I book Dr. Priya Nair tomorrow from 2:00 PM to 3:00 PM?"*
+* **Agent Response:** Confirms Dr. Priya Nair's availability and prompts for missing intake fields: **Patient Full Name**, **Contact Number**, **Address / Area in Mumbai**, **Service Type / Reason for Visit**, and optional **Special Notes**.
 
 ### Step 2: Patient Provides Details (Draft Staged for Coordinator)
 * **User Reply:** *"Rahul Sharma, 9876543210, Ghatkopar, Geriatric consult"*
-* **Agent Response:**  
-  *"Thank you! I have prepared your appointment draft! Our care coordinator will review and confirm this booking momentarily. (Draft ID: DRAFT-01, Patient: Rahul Sharma, Contact: +91 9876543210, Area: Ghatkopar, Service: Geriatric consult, Assigned Staff: Dr. Priya Nair, Date: 2026-10-13, Time Slot: 2:00 PM - 3:00 PM, Status: Pending Approval)."*
+* **Agent Response:** Stages `DRAFT-01` (`Status: Pending Approval`) in `data/staged_drafts.json` without modifying Excel.
 
 ### Step 3: Coordinator Login & Approval
-* The coordinator opens the **Coordinator Login** tab, authenticates with their Coordinator ID (`Coordinator_Prashna`) and password, reviews `DRAFT-01`, and clicks **Approve & Write to Calendar**.
-* `write_booking` commits row `BK-113` to Excel with `Status = Confirmed` and `Notes = Staged via Patient Chat | Approved by Coordinator_Prashna`, immediately blocking `2:00 PM - 3:00 PM` on `2026-10-13` for subsequent conflict checks.
+* The coordinator opens the **Coordinator Login** tab, signs in with their Coordinator ID (e.g., `Coordinator_Prashna`) and password, reviews/edits `DRAFT-01`, and clicks **Approve & Write to Calendar**.
+* `write_booking` commits row `BK-xxx` to `Bookings Calendar` with `Status = Confirmed`, immediately blocking that slot for subsequent conflict checks.
 
 ---
 
 ## Project Structure
 
 ```text
-├── app.py                  # Streamlit Two-Tab UI (Patient Chat & Coordinator Portal)
-├── calendar_engine.py      # Core Excel engine, staging queue & 4 core tools
-├── langchain_agent.py      # Conversational agent, patient intake parser & LLM router
-├── agent.py                # Agent entry point
-├── main.py                 # Interactive CLI tester
-├── test_engine.py          # Pytest unit & integration suite (19 automated tests)
-├── requirements.txt        # Python dependencies
-├── README.md               # Documentation (Week 6 Milestone)
-├── .gitignore              # Repository exclusions
+├── app.py                                                  # Streamlit Two-Tab UI (Patient Chat & Coordinator Portal)
+├── calendar_engine.py                                      # Core Excel engine, mtime cache, staging queue & 4 core tools
+├── langchain_agent.py                                      # Conversational agent, intake parser, emergency bypass & LLM router
+├── agent.py                                                # Stateless integration entrypoint (ask_agent & CORE_TOOLS)
+├── main.py                                                 # Interactive CLI tester
+├── test_engine.py                                          # Pytest suite (24 automated tests with tmp_path isolation)
+├── requirements.txt                                        # Python dependencies
+├── README.md                                               # Project documentation
+├── .gitignore                                              # Repository exclusions
+├── WK-4 Test Cases.xlsx                                    # Week 4 structured test cases (11 scenarios)
 └── data/
-    └── Saathi_Sneha_Care_Scheduling_Calendar_Mockup.xlsx  # Excel calendar database
+    └── Saathi_Sneha_Care_Scheduling_Calendar_Mockup.xlsx   # Single-source-of-truth Excel calendar database
 ```
 
 ---
@@ -93,7 +91,7 @@ This milestone delivers the complete **Week 6 Human-in-the-Loop (HITL) Booking W
    ```
 
 3. **Optional Environment Variables (`.env`):**
-   * `OPENROUTER_API_KEY` / `GOOGLE_API_KEY`: Optional LLM API keys (falls back automatically to the deterministic 4-tool conversational engine).
+   * `OPENROUTER_API_KEY` / `GOOGLE_API_KEY`: Optional LLM API keys (automatically falls back to the deterministic 4-tool engine if omitted or unavailable).
    * `COORDINATOR_PASSWORD`: Password for the Coordinator Review tab in `app.py` (defaults to `saathi123`).
 
 ---
@@ -111,7 +109,7 @@ python main.py
 ```
 
 ### 3. Run Automated Tests
-Execute the full 19-test verification suite with `pytest`:
+Execute the full **24-test** isolated verification suite with `pytest` (never modifies production Excel or `staged_drafts.json`):
 
 ```bash
 pytest test_engine.py -v
@@ -121,6 +119,7 @@ pytest test_engine.py -v
 
 ## Safety & Guardrails
 
-1. **Zero Unsupervised Writes:** The AI agent only stages drafts (`DRAFT-xx`). Writing to the Excel database strictly requires human coordinator approval (`approved_by`) via `write_booking`.
-2. **TOCTOU Double-Booking & Concurrency Protection:** `write_booking` acquires a thread lock (`threading.RLock`), re-runs `check_conflict` right before saving to Excel, and catches `PermissionError` if the `.xlsx` file is locked by desktop Excel.
-3. **Zero Medical Advice / Triage:** Clinical emergencies bypass scheduling and escalate immediately to a human coordinator.
+1. **Zero Unsupervised Writes:** `write_booking_tool` is excluded from the LLM toolset. The agent can only stage drafts (`DRAFT-xx`); writing to Excel strictly requires an allowlisted human coordinator (`approved_by`).
+2. **TOCTOU Concurrency & Auto-Cancellation:** `write_booking` acquires `threading.RLock`, re-checks conflicts right before saving, auto-cancels overlapping drafts (even across Staff ID vs. Name variants), and catches `PermissionError` if desktop Excel has the file locked.
+3. **Clinical Emergency Bypass & Prompt Isolation:** Acute medical emergencies bypass scheduling and immediately escalate to **108 / 112**. User input passed to LLMs is wrapped in `<client_inquiry>` tags as untrusted data.
+4. **Data & Boundary Integrity:** Blocks past dates and elapsed same-day slots, keeps `Staff Availability` strictly read-only, anchors file paths to `BASE_DIR` (CWD-independent), and rejects ambiguous staff lookups instead of silently guessing.

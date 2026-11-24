@@ -98,6 +98,12 @@ scratch/
 tmp/
 *.zip
 
+# Microsoft Office temporary / lock files & local presentation/brief docs
+~$*
+.~lock.*#
+Saathi_Sneha_Care_Final_Meeting_and_Code_Review_Brief.docx
+Saathi_Sneha_Care_Internship_Presentation.pptx
+
 # Runtime staged booking drafts
 data/staged_drafts.json
 agent.md

@@ -10,7 +10,8 @@ from datetime import datetime, date, time, timedelta
 from typing import List, Dict, Any, Optional, Tuple, Union
 import pandas as pd
 
-EXCEL_PATH = os.path.join("data", "Saathi_Sneha_Care_Scheduling_Calendar_Mockup.xlsx")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+EXCEL_PATH = os.path.join(BASE_DIR, "data", "Saathi_Sneha_Care_Scheduling_Calendar_Mockup.xlsx")
 
 # Thread-safe in-memory cache mapped by (excel_path, sheet_name) -> (mtime, pd.DataFrame)
 _SHEET_CACHE: Dict[Tuple[str, str], Tuple[float, pd.DataFrame]] = {}
@@ -73,6 +74,15 @@ def parse_date(date_val: Union[str, datetime, date]) -> Optional[date]:
         return None
     
     date_str = str(date_val).strip()
+    rel_key = re.sub(r'\s+', ' ', date_str.lower())
+    if rel_key in ("today", "tonight"):
+        return date.today()
+    if rel_key == "tomorrow":
+        return date.today() + timedelta(days=1)
+    if rel_key == "day after tomorrow":
+        return date.today() + timedelta(days=2)
+    if rel_key == "yesterday":
+        return date.today() - timedelta(days=1)
     formats = (
         "%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y", "%d/%m/%Y", 
         "%d-%b-%Y", "%d-%B-%Y", "%d/%b/%Y", "%d/%B/%Y",
@@ -108,13 +118,19 @@ def parse_single_time(t_str: str) -> Optional[time]:
 
 
 def parse_time_range(time_str: str) -> Optional[Tuple[time, time]]:
-    """Parses time range ('9:00 AM - 1:00 PM', '10am to 2pm')."""
+    """Parses time range ('9:00 AM - 1:00 PM', '10am to 2pm') or single time ('11am' -> 1-hour slot)."""
     if not isinstance(time_str, str) or not time_str.strip():
         return None
     normalized = time_str.replace('–', '-').replace('—', '-').replace('–', '-')
     normalized = re.sub(r'\s+to\s+', '-', normalized, flags=re.IGNORECASE)
     if '-' not in normalized:
-        return None
+        # Treat single-time entries like "11am" as a 1-hour block so conflict checks never miss them
+        t1 = parse_single_time(normalized)
+        if not t1:
+            return None
+        end_dt = datetime.combine(date.today(), t1) + timedelta(hours=1)
+        t2 = end_dt.time() if end_dt.date() == date.today() else time(23, 59)
+        return (t1, t2)
     parts = normalized.split('-', 1)
     t1 = parse_single_time(parts[0])
     t2 = parse_single_time(parts[1])
@@ -146,7 +162,12 @@ def format_time_slot(t1: time, t2: time) -> str:
     return f"{s1} - {s2}"
 
 
-def get_available_windows(working_hours_str: str, booked_slots: List[str], slot_duration_minutes: int = 60) -> List[str]:
+def get_available_windows(
+    working_hours_str: str,
+    booked_slots: List[str],
+    slot_duration_minutes: int = 60,
+    min_start_time: Optional[time] = None
+) -> List[str]:
     """Calculates discrete non-overlapping 1-hour slots during a working shift."""
     shift = parse_time_range(working_hours_str)
     if not shift:
@@ -157,10 +178,11 @@ def get_available_windows(working_hours_str: str, booked_slots: List[str], slot_
     
     while curr + timedelta(minutes=slot_duration_minutes) <= end_dt:
         slot_end = curr + timedelta(minutes=slot_duration_minutes)
-        cand_slot_str = format_time_slot(curr.time(), slot_end.time())
-        conflict = any(times_overlap(cand_slot_str, b) for b in booked_slots)
-        if not conflict:
-            available_slots.append(cand_slot_str)
+        if min_start_time is None or curr.time() >= min_start_time:
+            cand_slot_str = format_time_slot(curr.time(), slot_end.time())
+            conflict = any(times_overlap(cand_slot_str, b) for b in booked_slots)
+            if not conflict:
+                available_slots.append(cand_slot_str)
         curr += timedelta(minutes=slot_duration_minutes)
     return available_slots
 
@@ -207,6 +229,11 @@ def read_availability(
         available_staff.append(staff_member)
         
     return available_staff
+
+
+def _norm_staff_label(val: Any) -> str:
+    """Normalizes staff names/IDs ignoring punctuation differences like 'Dr.' vs 'dr'."""
+    return re.sub(r'[^a-z0-9]+', ' ', str(val or '').lower()).strip()
 
 
 def _resolve_staff_row(avail_df: pd.DataFrame, staff_id: str) -> Optional[pd.Series]:
@@ -267,18 +294,25 @@ def check_conflict(
         
     if slot and not is_time_within_window(slot, shift):
         return True
+
+    if slot and target_date == datetime.now().date():
+        parsed_slot = parse_time_range(slot)
+        if parsed_slot and parsed_slot[0] < datetime.now().time():
+            return True
         
-    # 2. Check active bookings in Bookings Calendar using exact resolved staff name or ID
+    # 2. Check active bookings in Bookings Calendar using normalized resolved staff name or ID
     bookings_df = load_sheet("Bookings Calendar", excel_path=excel_path)
     bookings_df['ParsedDate'] = bookings_df['Date'].apply(parse_date)
     
-    assigned_col = bookings_df['Assigned Staff'].astype(str).str.strip().str.lower()
+    assigned_col = bookings_df['Assigned Staff'].apply(_norm_staff_label)
     status_col = bookings_df['Status'].astype(str).str.strip().str.lower()
+    norm_staff_name = _norm_staff_label(staff_name)
+    norm_resolved_id = _norm_staff_label(resolved_id)
     
     day_bookings = bookings_df[
         (bookings_df['ParsedDate'] == target_date) &
         (status_col != 'cancelled') &
-        ((assigned_col == staff_name.lower()) | (assigned_col == resolved_id))
+        ((assigned_col == norm_staff_name) | (assigned_col == norm_resolved_id))
     ]
     
     for _, b in day_bookings.iterrows():
@@ -329,20 +363,21 @@ def propose_slot(
             if check_conflict(staff_id=staff['staff_id'], slot=slot, date=date, excel_path=excel_path):
                 continue
                 
-        # Calculate available open 1-hour slots using exact staff name or ID
-        staff_name = staff['name'].strip().lower()
-        staff_id_low = staff['staff_id'].strip().lower()
-        assigned_col = bookings_df['Assigned Staff'].astype(str).str.strip().str.lower()
+        # Calculate available open 1-hour slots using normalized staff name or ID
+        norm_staff_name = _norm_staff_label(staff['name'])
+        norm_staff_id = _norm_staff_label(staff['staff_id'])
+        assigned_col = bookings_df['Assigned Staff'].apply(_norm_staff_label)
         day_bookings = bookings_df[
             (bookings_df['ParsedDate'] == target_date) &
             (bookings_df['Status'].astype(str).str.lower() != 'cancelled') &
-            ((assigned_col == staff_name) | (assigned_col == staff_id_low))
+            ((assigned_col == norm_staff_name) | (assigned_col == norm_staff_id))
         ]
         booked_slots = [str(b['Time Slot']).strip() for _, b in day_bookings.iterrows()]
-        open_slots = get_available_windows(staff['working_hours'], booked_slots)
+        min_start = datetime.now().time() if target_date == datetime.now().date() else None
+        open_slots = get_available_windows(staff['working_hours'], booked_slots, min_start_time=min_start)
         
-        # If open slots exist, include candidate with top 2-3 proposed slots
-        if open_slots or not booked_slots:
+        # Only include candidate when at least one open slot remains
+        if open_slots:
             cand = dict(staff)
             cand["date"] = date
             cand["proposed_slots"] = [slot] if slot else open_slots[:3]
@@ -359,7 +394,7 @@ import json
 import threading
 
 _BOOKING_LOCK = threading.RLock()
-STAGED_DRAFTS_PATH = os.path.join("data", "staged_drafts.json")
+STAGED_DRAFTS_PATH = os.path.join(BASE_DIR, "data", "staged_drafts.json")
 _STAGED_DRAFTS: List[Dict[str, Any]] = []
 _DRAFT_COUNTER: int = 0
 DEFAULT_AUTHORIZED_COORDINATORS = {"coordinator_prashna", "coordinator_admin", "coordinator_sneha"}
@@ -430,6 +465,20 @@ def normalize_booking_contract(booking_data: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _validate_not_past_date(date_str: str) -> date:
+    """Rejects unparseable or past dates (earlier than today) at booking boundaries."""
+    b_date = parse_date(date_str)
+    if not b_date:
+        raise ValueError(f"INVALID DATE: Could not parse booking date '{date_str}'.")
+    today = date.today()
+    if b_date < today:
+        raise ValueError(
+            f"PAST DATE ERROR: Cannot book or finalize an appointment for a past date ({b_date.strftime('%Y-%m-%d')}). "
+            f"Bookings must be for today ({today.strftime('%Y-%m-%d')}) or a future date."
+        )
+    return b_date
+
+
 def stage_booking_draft(booking_data: Dict[str, Any], persist_draft: bool = True) -> Dict[str, Any]:
     """
     Stages a conflict-free booking draft in memory and JSON disk journal for coordinator review.
@@ -437,6 +486,8 @@ def stage_booking_draft(booking_data: Dict[str, Any], persist_draft: bool = True
     """
     global _DRAFT_COUNTER
     contract = normalize_booking_contract(booking_data)
+    if contract["date"]:
+        _validate_not_past_date(contract["date"])
     contract["status"] = "Pending Approval"
 
     with _BOOKING_LOCK:
@@ -526,6 +577,8 @@ def write_booking(
             "MISSING SCHEDULE FIELDS: 'date', 'time_slot', and 'assigned_staff' are required to write a booking."
         )
 
+    _validate_not_past_date(contract["date"])
+
     if not os.path.exists(excel_path):
         raise FileNotFoundError(f"Database file not found at {excel_path}")
 
@@ -544,61 +597,91 @@ def write_booking(
             )
 
         wb = openpyxl.load_workbook(excel_path)
-        ws = wb["Bookings Calendar"]
-
-        if not booking_id:
-            booking_id = _next_bk_id_from_ws(ws)
-
-        b_date = parse_date(contract["date"])
-        date_val = datetime.combine(b_date, time(0, 0)) if b_date else contract["date"]
-
-        base_notes = contract["notes"]
-        approval_note = f"Approved by {clean_approver}"
-        final_notes = f"{base_notes} | {approval_note}" if base_notes else approval_note
-
-        last_row_idx = 5
-        for idx, row in enumerate(ws.iter_rows(min_row=5, values_only=True), start=5):
-            if any(cell is not None and str(cell).strip() != "" for cell in row):
-                last_row_idx = idx
-        target_row_idx = last_row_idx + 1
-
-        new_row_values = [
-            booking_id,
-            date_val,
-            contract["time_slot"],
-            contract["patient_name"],
-            contract["service_type"],
-            contract["assigned_staff"],
-            contract["staff_role"],
-            "Confirmed",
-            contract["contact_number"],
-            contract["address_area"],
-            final_notes
-        ]
-
-        for col_idx, val in enumerate(new_row_values, start=1):
-            ws.cell(row=target_row_idx, column=col_idx, value=val)
-
         try:
-            wb.save(excel_path)
-        except PermissionError as exc:
+            ws = wb["Bookings Calendar"]
+
+            if not booking_id:
+                booking_id = _next_bk_id_from_ws(ws)
+
+            b_date = parse_date(contract["date"])
+            date_val = datetime.combine(b_date, time(0, 0)) if b_date else contract["date"]
+
+            base_notes = contract["notes"]
+            approval_note = f"Approved by {clean_approver}"
+            final_notes = f"{base_notes} | {approval_note}" if base_notes else approval_note
+
+            last_row_idx = 5
+            for idx, row in enumerate(ws.iter_rows(min_row=5, values_only=True), start=5):
+                if any(cell is not None and str(cell).strip() != "" for cell in row):
+                    last_row_idx = idx
+            target_row_idx = last_row_idx + 1
+
+            new_row_values = [
+                booking_id,
+                date_val,
+                contract["time_slot"],
+                contract["patient_name"],
+                contract["service_type"],
+                contract["assigned_staff"],
+                contract["staff_role"],
+                "Confirmed",
+                contract["contact_number"],
+                contract["address_area"],
+                final_notes
+            ]
+
+            for col_idx, val in enumerate(new_row_values, start=1):
+                cell = ws.cell(row=target_row_idx, column=col_idx, value=val)
+                if col_idx == 2 and isinstance(val, datetime):
+                    cell.number_format = 'ddd", "dd-mmm-yyyy'
+
+            try:
+                wb.save(excel_path)
+            except PermissionError as exc:
+                raise PermissionError(
+                    "EXCEL FILE LOCKED: Please close the Excel calendar file in Microsoft Excel and try again."
+                ) from exc
+        finally:
             wb.close()
-            raise PermissionError(
-                "EXCEL FILE LOCKED: Please close the Excel calendar file in Microsoft Excel and try again."
-            ) from exc
 
         _SHEET_CACHE.clear()
 
         draft_id = booking_data.get("draft_id")
-        _STAGED_DRAFTS = [
-            d for d in _STAGED_DRAFTS
-            if d.get("draft_id") != draft_id
-            and not (
+        avail_df = load_sheet("Staff Availability", excel_path=excel_path)
+
+        def _canonical_staff_key(staff_val: str) -> str:
+            try:
+                row = _resolve_staff_row(avail_df, staff_val)
+                if row is not None:
+                    return str(row.get("Staff ID", staff_val)).strip().lower()
+            except ValueError:
+                pass
+            return staff_val.strip().lower()
+
+        booked_staff_key = _canonical_staff_key(contract["assigned_staff"])
+        remaining_drafts: List[Dict[str, Any]] = []
+        auto_cancelled_drafts: List[Dict[str, Any]] = []
+
+        for d in _STAGED_DRAFTS:
+            if draft_id and d.get("draft_id") == draft_id:
+                continue
+            is_conflict = (
                 d.get("date") == contract["date"]
-                and d.get("assigned_staff", "").lower() == contract["assigned_staff"].lower()
+                and _canonical_staff_key(d.get("assigned_staff", "")) == booked_staff_key
                 and times_overlap(d.get("time_slot", ""), contract["time_slot"])
             )
-        ]
+            if is_conflict:
+                cancelled = dict(d)
+                cancelled["status"] = "Cancelled"
+                cancelled["cancellation_reason"] = (
+                    f"Slot confirmed for booking {booking_id} ({contract['assigned_staff']} on "
+                    f"{contract['date']} {contract['time_slot']})."
+                )
+                auto_cancelled_drafts.append(cancelled)
+            else:
+                remaining_drafts.append(d)
+
+        _STAGED_DRAFTS = remaining_drafts
         _save_drafts_to_disk()
 
     return {
@@ -607,8 +690,92 @@ def write_booking(
         "message": f"Booking {booking_id} confirmed & written under coordinator approval: '{clean_approver}'",
         "approved_by": clean_approver,
         "booking": contract,
-        "booking_data": contract
+        "booking_data": contract,
+        "auto_cancelled_drafts": auto_cancelled_drafts
     }
+
+
+def save_sheet_edits(
+    sheet_name: str,
+    edited_df: pd.DataFrame,
+    approved_by: str,
+    excel_path: str = EXCEL_PATH
+) -> int:
+    """
+    Saves manual coordinator edits strictly for 'Bookings Calendar' back to Excel
+    while preserving title rows (1-4), headers (row 5), and never modifying 'Staff Availability'.
+    """
+    verify_coordinator_approval(approved_by)
+    if sheet_name != "Bookings Calendar":
+        raise ValueError(
+            f"READ-ONLY SHEET ERROR: '{sheet_name}' is read-only and cannot be modified. "
+            f"Only 'Bookings Calendar' can be written."
+        )
+    if not os.path.exists(excel_path):
+        raise FileNotFoundError(f"Database file not found at {excel_path}")
+
+    target_key = "Booking ID"
+    import openpyxl
+
+    with _BOOKING_LOCK:
+        wb = openpyxl.load_workbook(excel_path)
+        try:
+            ws = wb[sheet_name]
+
+            header_row_idx = 5
+            headers: List[str] = []
+            for idx, row in enumerate(ws.iter_rows(min_row=1, max_row=10, values_only=True), start=1):
+                vals = [str(v).strip() if v is not None else "" for v in row]
+                if target_key in vals:
+                    header_row_idx = idx
+                    headers = [v for v in vals if v]
+                    break
+
+            if not headers:
+                headers = [str(c).strip() for c in edited_df.columns]
+
+            # Drop completely empty rows from dynamic data_editor
+            clean_rows: List[List[Any]] = []
+            for _, row in edited_df.iterrows():
+                row_vals = []
+                has_any = False
+                for col in headers:
+                    val = row.get(col, None) if col in edited_df.columns else None
+                    if pd.isna(val) or (isinstance(val, str) and not val.strip()):
+                        val = None
+                    else:
+                        has_any = True
+                        if sheet_name == "Bookings Calendar" and col == "Date":
+                            parsed = parse_date(val)
+                            if parsed:
+                                val = datetime.combine(parsed, time(0, 0))
+                    row_vals.append(val)
+                if has_any:
+                    clean_rows.append(row_vals)
+
+            # Clear existing data rows below header without touching title/header rows
+            max_clear_row = max(ws.max_row, header_row_idx + len(clean_rows))
+            for r_idx in range(header_row_idx + 1, max_clear_row + 1):
+                for c_idx in range(1, len(headers) + 1):
+                    ws.cell(row=r_idx, column=c_idx, value=None)
+
+            for offset, row_vals in enumerate(clean_rows, start=1):
+                for c_idx, val in enumerate(row_vals, start=1):
+                    cell = ws.cell(row=header_row_idx + offset, column=c_idx, value=val)
+                    if sheet_name == "Bookings Calendar" and c_idx == 2 and isinstance(val, datetime):
+                        cell.number_format = 'ddd", "dd-mmm-yyyy'
+
+            try:
+                wb.save(excel_path)
+            except PermissionError as exc:
+                raise PermissionError(
+                    "EXCEL FILE LOCKED: Please close the Excel calendar file in Microsoft Excel and try again."
+                ) from exc
+        finally:
+            wb.close()
+
+        _SHEET_CACHE.clear()
+        return len(clean_rows)
 
 
 # =========================================================================

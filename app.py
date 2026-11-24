@@ -11,11 +11,14 @@ import uuid
 import streamlit as st
 from langchain_agent import ask_agent
 from calendar_engine import (
+    EXCEL_PATH,
     get_staged_drafts,
     dismiss_staged_draft,
     write_booking,
     verify_coordinator_approval,
-    load_sheet
+    load_sheet,
+    save_sheet_edits,
+    _SHEET_CACHE
 )
 
 # Page Configuration - Clean single-screen interface
@@ -156,8 +159,8 @@ with tab_chat:
         btn1 = st.button("Is Dr. Iyer free on 2026-09-28?", use_container_width=True)
         btn2 = st.button("Is Nurse Sunita Rao free on 2026-09-24?", use_container_width=True)
     with q_col2:
-        btn3 = st.button("Can I book Dr. Priya Nair on 13-Oct-2026 from 2:00 PM to 3:00 PM?", use_container_width=True)
-        btn4 = st.button("Is any nurse free on 2026-09-21?", use_container_width=True)
+        btn3 = st.button("Can I book Dr. Priya Nair tomorrow from 2:00 PM to 3:00 PM?", use_container_width=True)
+        btn4 = st.button("What doctors are available for a visit today?", use_container_width=True)
 
     selected_prompt = None
     if btn1:
@@ -165,9 +168,9 @@ with tab_chat:
     elif btn2:
         selected_prompt = "Is Nurse Sunita Rao free on 2026-09-24?"
     elif btn3:
-        selected_prompt = "Can I book Dr. Priya Nair on 13-Oct-2026 from 2:00 PM to 3:00 PM?"
+        selected_prompt = "Can I book Dr. Priya Nair tomorrow from 2:00 PM to 3:00 PM?"
     elif btn4:
-        selected_prompt = "Is any nurse free on 2026-09-21?"
+        selected_prompt = "What doctors are available for a visit today?"
 
     st.caption("🔒 *Demo Mode Notice: Please use synthetic patient names and contact details during intake.*")
 
@@ -250,6 +253,15 @@ with tab_coord:
                 f"on **{last_bk['booking']['date']} ({last_bk['booking']['time_slot']})** — "
                 f"Approved by `{last_bk['approved_by']}`."
             )
+            cancelled_list = last_bk.get("auto_cancelled_drafts") or []
+            if cancelled_list:
+                cancelled_summary = ", ".join(
+                    f"`{c['draft_id']}` ({c['patient_name']}, {c['time_slot']})" for c in cancelled_list
+                )
+                st.warning(
+                    f"⚠️ **Auto-Cancelled Overlapping Draft(s):** {cancelled_summary} — "
+                    f"cancelled immediately because this clinician/time slot was just confirmed."
+                )
 
         st.markdown("#### 📋 Staged Booking Drafts")
         if not staged_drafts:
@@ -315,6 +327,17 @@ with tab_coord:
                                         f"**{res['approved_by']}** and recorded in our calendar!"
                                     )
                                 })
+                                for c in res.get("auto_cancelled_drafts", []):
+                                    if c.get("session_id") == st.session_state["session_id"]:
+                                        st.session_state["messages"].append({
+                                            "role": "assistant",
+                                            "content": (
+                                                f"❌ **Draft Cancelled (`{c['draft_id']}`):** Your pending request for "
+                                                f"**{c['patient_name']}** with **{c['assigned_staff']}** on **{c['date']}** "
+                                                f"({c['time_slot']}) was automatically cancelled because that slot was just "
+                                                f"confirmed for another booking. Please ask me for other open slots!"
+                                            )
+                                        })
                                 st.rerun()
                             except Exception as e:
                                 st.error(f"Approval failed: {e}")
@@ -329,12 +352,94 @@ with tab_coord:
                             st.rerun()
 
         st.markdown("---")
-        with st.expander("📊 Live Bookings Calendar (Excel Single Source of Truth)", expanded=True):
-            try:
-                bookings_df = load_sheet("Bookings Calendar")
-                st.dataframe(bookings_df.tail(10), use_container_width=True, hide_index=True)
-            except Exception as e:
-                st.warning(f"Could not load Bookings Calendar preview: {e}")
+        with st.expander("📊 View & Edit Excel Workbook (Excel / Google Sheets)", expanded=True):
+            abs_excel_path = os.path.abspath(EXCEL_PATH)
+            gsheets_url = (os.getenv("GOOGLE_SHEETS_URL") or "").strip()
+
+            act_c1, act_c2, act_c3 = st.columns(3)
+            with act_c1:
+                if st.button("📂 Open in Excel", use_container_width=True):
+                    try:
+                        if os.name == "nt":
+                            os.startfile(abs_excel_path)
+                            st.info("Opened in Microsoft Excel. Close Excel after saving so the app can write updates.")
+                        else:
+                            st.info(f"Workbook path: `{abs_excel_path}`")
+                    except Exception as e:
+                        st.error(f"Could not launch Excel: {e}")
+            with act_c2:
+                if os.path.exists(abs_excel_path):
+                    with open(abs_excel_path, "rb") as xl_file:
+                        st.download_button(
+                            "⬇️ Download .xlsx",
+                            data=xl_file.read(),
+                            file_name=os.path.basename(abs_excel_path),
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True
+                        )
+            with act_c3:
+                if gsheets_url:
+                    st.link_button("🔗 Open Google Sheets", gsheets_url, use_container_width=True)
+                else:
+                    st.caption("Tip: Set `GOOGLE_SHEETS_URL` in `.env` for a 1-click Google Sheets link, or download `.xlsx` and open in Google Sheets.")
+
+            # Re-upload an Excel file edited externally (e.g., downloaded from Google Sheets or Excel)
+            uploaded_xlsx = st.file_uploader(
+                "⬆️ Upload edited .xlsx (from Excel or Google Sheets) to sync back",
+                type=["xlsx"],
+                key="upload_excel_sync"
+            )
+            if uploaded_xlsx is not None and st.button("🔄 Apply Uploaded .xlsx", key="apply_uploaded_xlsx"):
+                try:
+                    import io
+                    import openpyxl
+                    raw_bytes = uploaded_xlsx.getvalue()
+                    check_wb = openpyxl.load_workbook(io.BytesIO(raw_bytes), read_only=True)
+                    sheets = set(check_wb.sheetnames)
+                    check_wb.close()
+                    if not {"Staff Availability", "Bookings Calendar"}.issubset(sheets):
+                        st.error("Uploaded workbook must contain both 'Staff Availability' and 'Bookings Calendar' sheets.")
+                    else:
+                        with open(abs_excel_path, "wb") as out_f:
+                            out_f.write(raw_bytes)
+                        _SHEET_CACHE.clear()
+                        st.success("✅ Uploaded workbook synced! Reloading schedules...")
+                        st.rerun()
+                except PermissionError:
+                    st.error("EXCEL FILE LOCKED: Close the file in Microsoft Excel and try again.")
+                except Exception as e:
+                    st.error(f"Upload failed: {e}")
+
+            sheet_tab1, sheet_tab2 = st.tabs(["📅 Bookings Calendar (Editable)", "👩‍⚕️ Staff Availability (Read-Only)"])
+
+            with sheet_tab1:
+                try:
+                    bookings_df = load_sheet("Bookings Calendar")
+                    if "Date" in bookings_df.columns:
+                        bookings_df["Date"] = bookings_df["Date"].apply(
+                            lambda v: v.strftime("%Y-%m-%d") if hasattr(v, "strftime") else ("" if v is None else str(v))
+                        )
+                    edited_bookings = st.data_editor(
+                        bookings_df,
+                        num_rows="dynamic",
+                        use_container_width=True,
+                        hide_index=True,
+                        key="editor_bookings_calendar"
+                    )
+                    if st.button("💾 Save Bookings Calendar", key="save_bookings_btn", use_container_width=True):
+                        saved_n = save_sheet_edits("Bookings Calendar", edited_bookings, approved_by=coord_name)
+                        st.success(f"✅ Saved {saved_n} booking row(s) to Excel!")
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"Bookings Calendar error: {e}")
+
+            with sheet_tab2:
+                st.caption("🔒 Read-only view: the agent and app never modify the `Staff Availability` sheet.")
+                try:
+                    staff_df = load_sheet("Staff Availability")
+                    st.dataframe(staff_df, use_container_width=True, hide_index=True)
+                except Exception as e:
+                    st.error(f"Staff Availability error: {e}")
 
 # ---------------------------------------------------------------------------
 # 💬 GLOBAL CHAT INPUT (Processed at root level so it works seamlessly)

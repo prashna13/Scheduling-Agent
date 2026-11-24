@@ -19,7 +19,7 @@ import re
 import json
 import logging
 import unicodedata
-from datetime import datetime, date, time as dt_time
+from datetime import datetime, date, time as dt_time, timedelta
 from typing import Optional, Dict, Any, List, Tuple
 import requests
 from dotenv import load_dotenv
@@ -149,6 +149,13 @@ CORE_TOOLS = [
     write_booking_tool
 ]
 
+# Week 6 HITL safety: autonomous LLM executors only receive read-only tools (never write_booking_tool).
+AGENT_READ_ONLY_TOOLS = [
+    read_availability_tool,
+    check_conflict_tool,
+    propose_slot_tool
+]
+
 
 # =========================================================================
 # 🤖 MODEL PROMPT & CONFIGURATION
@@ -166,11 +173,12 @@ When a client wants to book a specific conflict-free slot, you MUST collect all 
 4. Service Type / Reason for Visit
 5. Special Notes (Optional)
 
-You have access to exactly 4 core tools:
+You have access to 3 read-only scheduling tools:
 1. `read_availability_tool`: Look up staff on duty for a date.
 2. `check_conflict_tool`: Check if a staff member has a time slot conflict or is off.
 3. `propose_slot_tool`: Propose 2-3 conflict-free time slots for available staff.
-4. `write_booking_tool`: Commit an approved booking (requires coordinator approved_by).
+
+SAFETY RULE: You can NEVER finalize or write a booking yourself. All bookings must be reviewed and approved by a human care coordinator first.
 """
 
 LLM_CONVERSATIONAL_PROMPT = """You are the friendly, professional AI Care Coordinator for Saathi Sneha Care in Mumbai communicating with patients and families over WhatsApp and social messaging.
@@ -318,8 +326,8 @@ def get_langchain_agent_executor(api_key_override: Optional[str] = None) -> Opti
         MessagesPlaceholder(variable_name="agent_scratchpad"),
     ])
     
-    agent = create_tool_calling_agent(llm, CORE_TOOLS, prompt)
-    return AgentExecutor(agent=agent, tools=CORE_TOOLS, verbose=False)
+    agent = create_tool_calling_agent(llm, AGENT_READ_ONLY_TOOLS, prompt)
+    return AgentExecutor(agent=agent, tools=AGENT_READ_ONLY_TOOLS, verbose=False)
 
 
 # =========================================================================
@@ -351,7 +359,7 @@ def extract_date_from_query(query: str) -> Optional[str]:
     if dm_match:
         d = int(dm_match.group(1))
         m = MONTH_MAP[dm_match.group(2).lower()]
-        y = int(dm_match.group(3)) if dm_match.group(3) else 2026
+        y = int(dm_match.group(3)) if dm_match.group(3) else date.today().year
         return f"{y}-{m:02d}-{d:02d}"
 
     # 4. Month Name + Day (e.g., 'Oct-13-2026', 'Sept 24', 'September 28, 2026', 'Oct 13, 2026')
@@ -359,8 +367,19 @@ def extract_date_from_query(query: str) -> Optional[str]:
     if md_match:
         m = MONTH_MAP[md_match.group(1).lower()]
         d = int(md_match.group(2))
-        y = int(md_match.group(3)) if md_match.group(3) else 2026
+        y = int(md_match.group(3)) if md_match.group(3) else date.today().year
         return f"{y}-{m:02d}-{d:02d}"
+
+    # 5. Relative date keywords ('day after tomorrow', 'tomorrow', 'today', 'yesterday')
+    today = date.today()
+    if re.search(r'\bday\s+after\s+tomorrow\b', query, re.I):
+        return (today + timedelta(days=2)).strftime("%Y-%m-%d")
+    if re.search(r'\btomorrow\b', query, re.I):
+        return (today + timedelta(days=1)).strftime("%Y-%m-%d")
+    if re.search(r'\b(today|tonight)\b', query, re.I):
+        return today.strftime("%Y-%m-%d")
+    if re.search(r'\byesterday\b', query, re.I):
+        return (today - timedelta(days=1)).strftime("%Y-%m-%d")
 
     return None
 
@@ -750,7 +769,11 @@ def fallback_answer_query(
         if name_match:
             cand_name = name_match.group(0).strip()
             cand_words = [w.lower() for w in name_match.group(2).split()]
-            stop_words = {'available', 'free', 'on', 'duty', 'scheduled', 'there', 'who', 'someone', 'anyone', 'visit', 'appointment', 'work', 'working'}
+            stop_words = {
+                'available', 'free', 'on', 'duty', 'scheduled', 'there', 'who', 'someone',
+                'anyone', 'visit', 'appointment', 'work', 'working', 'today', 'tomorrow',
+                'yesterday', 'tonight', 'for', 'needed', 'please'
+            }
             if not any(w in stop_words for w in cand_words):
                 is_known = any(
                     s_name.lower() in cand_name.lower() or 
@@ -760,6 +783,20 @@ def fallback_answer_query(
                 )
                 if not is_known:
                     unknown_staff_name = cand_name
+
+    # Reject booking / staging attempts for dates already in the past
+    if target_date and (has_booking_keyword or in_active_intake_flow):
+        parsed_target = parse_date(target_date)
+        if parsed_target and parsed_target < date.today():
+            _ACTIVE_INTAKE_STATE.pop(session_id, None)
+            date_friendly = parsed_target.strftime("%A, %B %d, %Y")
+            today_friendly = date.today().strftime("%A, %B %d, %Y")
+            return (
+                f"Sorry, **{date_friendly}** (`{target_date}`) is in the past and outside our booking range "
+                f"(today is **{today_friendly}**).\n\n"
+                f"I cannot stage or finalize bookings for dates that have already passed. "
+                f"Please choose **today** or a **future date**, and I'll be happy to check available slots for you!"
+            )
 
     # SCENARIO 1: Checking or booking specific registered staff on date
     if target_staff and target_date:
@@ -971,6 +1008,7 @@ def ask_agent(
     # return the exact structured response so critical safety/booking state is never altered by an LLM.
     if (
         "URGENT MEDICAL ESCALATION" in grounded_eval
+        or "outside our booking range" in grounded_eval
         or "Awaiting Patient Intake Details:" in grounded_eval
         or "Staged Appointment Draft (" in grounded_eval
         or "No problem! I have cancelled" in grounded_eval

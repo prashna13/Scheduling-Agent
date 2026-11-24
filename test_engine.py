@@ -1,5 +1,24 @@
+import os
 import pytest
-from datetime import date, time
+from datetime import date, time, timedelta
+import calendar_engine
+
+
+@pytest.fixture(autouse=True)
+def _isolate_staged_drafts(tmp_path, monkeypatch):
+    """Ensure tests never overwrite or wipe real data/staged_drafts.json on disk."""
+    isolated_path = str(tmp_path / "test_staged_drafts.json")
+    monkeypatch.setattr(calendar_engine, "STAGED_DRAFTS_PATH", isolated_path)
+    monkeypatch.setattr(calendar_engine, "_STAGED_DRAFTS", [])
+    monkeypatch.setattr(calendar_engine, "_DRAFT_COUNTER", 0)
+    yield
+
+
+def _next_weekday(target_weekday: int) -> date:
+    """Returns the next future date matching target_weekday (0=Mon .. 6=Sun)."""
+    today = date.today()
+    days_ahead = (target_weekday - today.weekday()) % 7
+    return today + timedelta(days=days_ahead or 7)
 from calendar_engine import (
     read_availability,
     check_conflict,
@@ -22,7 +41,9 @@ from langchain_agent import (
     check_conflict_tool,
     propose_slot_tool,
     write_booking_tool,
-    CORE_TOOLS
+    CORE_TOOLS,
+    AGENT_READ_ONLY_TOOLS,
+    SYSTEM_PROMPT
 )
 
 # ==========================================
@@ -149,11 +170,12 @@ def test_write_booking_validation(tmp_path):
         write_booking(booking_data={"patient_name": "Test"}, approved_by="", excel_path=temp_excel)
 
     # Test 2: Valid coordinator approval generates sequential ID (e.g. BK-113) and writes to Excel
+    future_tue = _next_weekday(1).strftime("%Y-%m-%d")
     expected_next_id = get_next_booking_id(excel_path=temp_excel)
     booking_payload = {
         "patient_name": "Mr. Vinod Kulkarni",
         "contact_number": "+91 90xxxxxx14",
-        "date": "2026-10-13",
+        "date": future_tue,
         "time_slot": "2:00 PM - 3:00 PM",
         "assigned_staff": "Dr. Priya Nair",
         "staff_role": "Doctor",
@@ -163,7 +185,7 @@ def test_write_booking_validation(tmp_path):
         "notes": "Follow-up visit"
     }
     # Verify slot is initially conflict-free
-    assert check_conflict(staff_id="DR-02", slot="2:00 PM - 3:00 PM", date="2026-10-13", excel_path=temp_excel) is False
+    assert check_conflict(staff_id="DR-02", slot="2:00 PM - 3:00 PM", date=future_tue, excel_path=temp_excel) is False
 
     res = write_booking(booking_data=booking_payload, approved_by="Coordinator_Prashna", excel_path=temp_excel)
     assert res["status"] == "success"
@@ -171,7 +193,7 @@ def test_write_booking_validation(tmp_path):
     assert res["booking_id"] == expected_next_id
 
     # Test 3: Immediate subsequent check_conflict call on that slot returns True (conflict found)
-    assert check_conflict(staff_id="DR-02", slot="2:00 PM - 3:00 PM", date="2026-10-13", excel_path=temp_excel) is True
+    assert check_conflict(staff_id="DR-02", slot="2:00 PM - 3:00 PM", date=future_tue, excel_path=temp_excel) is True
 
     # Test 4: TOCTOU Double-Booking Guard blocks duplicate write_booking on the same slot
     with pytest.raises(ValueError, match="CONFLICT ERROR"):
@@ -179,7 +201,7 @@ def test_write_booking_validation(tmp_path):
 
     # Test 5: Title-Case keys from main.py CLI caller are normalized and written to Excel
     main_cli_payload = {
-        "Date": "2026-10-13",
+        "Date": future_tue,
         "Time Slot": "3:00 PM - 4:00 PM",
         "Patient Name": "Mrs. Asha Deshmukh",
         "Service Type": "Geriatric consult",
@@ -190,7 +212,7 @@ def test_write_booking_validation(tmp_path):
     }
     res_cli = write_booking(main_cli_payload, approved_by="Coordinator_Prashna", excel_path=temp_excel)
     assert res_cli["booking_id"].startswith("BK-")
-    assert check_conflict(staff_id="DR-02", slot="3:00 PM - 4:00 PM", date="2026-10-13", excel_path=temp_excel) is True
+    assert check_conflict(staff_id="DR-02", slot="3:00 PM - 4:00 PM", date=future_tue, excel_path=temp_excel) is True
 
 def test_conversational_draft_staging_and_multiturn():
     import os
@@ -199,8 +221,14 @@ def test_conversational_draft_staging_and_multiturn():
     _STAGED_DRAFTS.clear()
     _save_drafts_to_disk()
 
+    future_tue_dt = _next_weekday(1)
+    future_tue_iso = future_tue_dt.strftime("%Y-%m-%d")
+    future_tue_label = future_tue_dt.strftime("%d-%b-%Y")
+    future_fri_dt = _next_weekday(4)
+    future_fri_label = future_fri_dt.strftime("%d %B %Y")
+
     # Step A: Booking request WITHOUT patient details asks the patient for required Excel fields first
-    q1 = "Can I book Dr. Priya Nair on Tuesday, 13-Oct-2026, from 2:00 PM to 3:00 PM?"
+    q1 = f"Can I book Dr. Priya Nair on Tuesday, {future_tue_label}, from 2:00 PM to 3:00 PM?"
     reply1 = fallback_answer_query(q1)
     assert "awaiting patient intake details" in reply1.lower()
     assert "patient full name" in reply1.lower()
@@ -227,7 +255,7 @@ def test_conversational_draft_staging_and_multiturn():
     assert drafts[0]["address_area"] == "Ghatkopar"
     assert drafts[0]["service_type"] == "geriatric consult"
     assert drafts[0]["assigned_staff"] == "Dr. Priya Nair"
-    assert drafts[0]["date"] == "2026-10-13"
+    assert drafts[0]["date"] == future_tue_iso
     assert drafts[0]["time_slot"] == "2:00 PM - 3:00 PM"
 
     # Step C: Cancellation dismisses the actual staged draft for this session
@@ -235,9 +263,9 @@ def test_conversational_draft_staging_and_multiturn():
     assert "cancelled and removed your staged booking draft" in reply_cancel.lower()
     assert len(get_staged_drafts()) == 0
 
-    # Step D: Availability inquiry with a specific slot ("is dr iyer free on 2nd october 9am-10am?")
+    # Step D: Availability inquiry with a specific slot on a future Friday
     # followed by comma-separated intake ("reema dahal,98413245678,bandra,checkup") stages a real draft
-    q_iyer = "is dr iyer free on 2nd october 9am-10am?"
+    q_iyer = f"is dr iyer free on {future_fri_label} 9am-10am?"
     r_iyer1 = fallback_answer_query(q_iyer, session_id="reema_sess")
     r_iyer2 = fallback_answer_query(
         "reema dahal,98413245678,bandra,checkup",
@@ -270,10 +298,14 @@ def test_edge_cases_security_and_correctness(tmp_path, monkeypatch):
     temp_excel = str(tmp_path / "edge_calendar.xlsx")
     shutil.copyfile(EXCEL_PATH, temp_excel)
 
+    future_tue_dt = _next_weekday(1)
+    future_tue = future_tue_dt.strftime("%Y-%m-%d")
+    future_tue_label = future_tue_dt.strftime("%d-%b-%Y")
+
     valid_payload = {
         "patient_name": "Mr. Vinod Kulkarni",
         "contact_number": "+91 9012345614",
-        "date": "2026-10-13",
+        "date": future_tue,
         "time_slot": "2:00 PM - 3:00 PM",
         "assigned_staff": "Dr. Priya Nair",
         "staff_role": "Doctor",
@@ -312,7 +344,7 @@ def test_edge_cases_security_and_correctness(tmp_path, monkeypatch):
     # 7. Explicit session state tracking (independent of assistant message copy & isolated per session)
     _STAGED_DRAFTS.clear()
     _ACTIVE_INTAKE_STATE.clear()
-    fallback_answer_query("Can I book Dr. Priya Nair on 13-Oct-2026 from 2:00 PM to 3:00 PM?", session_id="patient_A")
+    fallback_answer_query(f"Can I book Dr. Priya Nair on {future_tue_label} from 2:00 PM to 3:00 PM?", session_id="patient_A")
     assert "patient_A" in _ACTIVE_INTAKE_STATE
     assert "patient_B" not in _ACTIVE_INTAKE_STATE
 
@@ -357,6 +389,12 @@ def test_core_tools_registered():
     assert "propose_slot_tool" in tool_names
     assert "write_booking_tool" in tool_names
 
+    # Week 6 HITL safety: autonomous LLM tool list must never include write_booking_tool
+    ro_names = [getattr(t, "name", getattr(t, "__name__", str(t))) for t in AGENT_READ_ONLY_TOOLS]
+    assert len(AGENT_READ_ONLY_TOOLS) == 3
+    assert "write_booking_tool" not in ro_names
+    assert "NEVER finalize" in SYSTEM_PROMPT
+
 def test_conversational_queries():
     # 1. Ask about Dr. Iyer on working day (Monday 2026-09-28)
     ans1 = ask_agent("Is Dr. Iyer free on 2026-09-28?")
@@ -372,8 +410,9 @@ def test_conversational_queries():
     ans3 = ask_agent("Is Dr. Iyer free on 2026-09-27?")
     assert "not available" in ans3.lower() or "off" in ans3.lower()
 
-    # 4. User screenshot query 1: Tuesday 13-Oct-2026
-    ans4 = ask_agent("Can I book Dr. Priya Nair on Tuesday, 13-Oct-2026, from 3:00 PM to 4:00 PM?")
+    # 4. Future Tuesday booking query
+    future_tue_label = _next_weekday(1).strftime("%d-%b-%Y")
+    ans4 = ask_agent(f"Can I book Dr. Priya Nair on Tuesday, {future_tue_label}, from 3:00 PM to 4:00 PM?")
     assert "unable to see" not in ans4.lower()
     assert "priya" in ans4.lower() or "slot" in ans4.lower() or "available" in ans4.lower()
 
@@ -415,3 +454,205 @@ def test_week3_slot_suggestion_engine():
     for cand in res_nurse["candidates"]:
         assert "proposed_slots" in cand
         assert 1 <= len(cand["proposed_slots"]) <= 3
+
+
+def test_relative_dates_and_past_date_guard(tmp_path):
+    import shutil
+    from calendar_engine import EXCEL_PATH, stage_booking_draft, get_staged_drafts, _STAGED_DRAFTS, _save_drafts_to_disk
+    from langchain_agent import fallback_answer_query
+
+    today = date.today()
+    yesterday = today - timedelta(days=1)
+    tomorrow = today + timedelta(days=1)
+    day_after = today + timedelta(days=2)
+
+    # 1. Relative date parsing in both extract_date_from_query and parse_date
+    assert extract_date_from_query("what doctors are available for visit today?") == today.strftime("%Y-%m-%d")
+    assert extract_date_from_query("Is any nurse free tomorrow?") == tomorrow.strftime("%Y-%m-%d")
+    assert extract_date_from_query("Can I book a doctor day after tomorrow?") == day_after.strftime("%Y-%m-%d")
+    assert extract_date_from_query("Book Dr. Priya Nair yesterday") == yesterday.strftime("%Y-%m-%d")
+    assert parse_date("today") == today
+    assert parse_date("tomorrow") == tomorrow
+    assert parse_date("yesterday") == yesterday
+
+    # 2. Natural conversational query with 'today'
+    today_reply = fallback_answer_query("what doctors are available for visit today?")
+    assert today.strftime("%B %d, %Y") in today_reply or "available" in today_reply.lower()
+
+    # 3. Past dates cannot be finalized in write_booking or staged in stage_booking_draft
+    temp_excel = str(tmp_path / "past_date_calendar.xlsx")
+    shutil.copyfile(EXCEL_PATH, temp_excel)
+    past_payload = {
+        "patient_name": "Test Patient",
+        "contact_number": "+91 9876543210",
+        "date": yesterday.strftime("%Y-%m-%d"),
+        "time_slot": "2:00 PM - 3:00 PM",
+        "assigned_staff": "Dr. Priya Nair",
+        "staff_role": "Doctor",
+        "service_type": "Geriatric consult",
+        "address_area": "Ghatkopar"
+    }
+    with pytest.raises(ValueError, match="PAST DATE ERROR"):
+        write_booking(past_payload, approved_by="Coordinator_Prashna", excel_path=temp_excel)
+    with pytest.raises(ValueError, match="PAST DATE ERROR"):
+        stage_booking_draft(past_payload)
+
+    # 4. Conversational booking request for yesterday / past date is rejected cleanly
+    _STAGED_DRAFTS.clear()
+    _save_drafts_to_disk()
+    past_reply = ask_agent(f"Can I book Dr. Priya Nair on {yesterday.strftime('%d %B %Y')} from 2:00 PM to 3:00 PM?")
+    assert "outside our booking range" in past_reply.lower()
+    assert len(get_staged_drafts()) == 0
+
+
+def test_auto_cancel_conflicting_drafts_on_approval(tmp_path):
+    import shutil
+    from calendar_engine import EXCEL_PATH, stage_booking_draft, get_staged_drafts, _STAGED_DRAFTS, _save_drafts_to_disk
+
+    temp_excel = str(tmp_path / "conflict_cancel_calendar.xlsx")
+    shutil.copyfile(EXCEL_PATH, temp_excel)
+    future_tue = _next_weekday(1).strftime("%Y-%m-%d")
+
+    _STAGED_DRAFTS.clear()
+    _save_drafts_to_disk()
+
+    # Stage 2 overlapping drafts for Dr. Priya Nair (2:00 PM - 3:00 PM) and 1 non-overlapping draft (4:00 PM - 5:00 PM)
+    d1 = stage_booking_draft({
+        "patient_name": "Patient One",
+        "contact_number": "+91 9876543210",
+        "date": future_tue,
+        "time_slot": "2:00 PM - 3:00 PM",
+        "assigned_staff": "Dr. Priya Nair",
+        "staff_role": "Doctor",
+        "service_type": "Geriatric consult",
+        "address_area": "Ghatkopar",
+        "session_id": "sess_1"
+    })
+    d2 = stage_booking_draft({
+        "patient_name": "Patient Two",
+        "contact_number": "+91 9820112233",
+        "date": future_tue,
+        "time_slot": "2:00 PM - 3:00 PM",
+        "assigned_staff": "Dr. Priya Nair",
+        "staff_role": "Doctor",
+        "service_type": "Geriatric consult",
+        "address_area": "Powai",
+        "session_id": "sess_2"
+    })
+    d3 = stage_booking_draft({
+        "patient_name": "Patient Three",
+        "contact_number": "+91 9811112222",
+        "date": future_tue,
+        "time_slot": "4:00 PM - 5:00 PM",
+        "assigned_staff": "Dr. Priya Nair",
+        "staff_role": "Doctor",
+        "service_type": "Geriatric consult",
+        "address_area": "Bandra",
+        "session_id": "sess_3"
+    })
+    assert len(get_staged_drafts()) == 3
+
+    # Approve d1 using Staff ID ("DR-02") to also verify canonical staff matching
+    approve_payload = dict(d1)
+    approve_payload["assigned_staff"] = "DR-02"
+    res = write_booking(approve_payload, approved_by="Coordinator_Prashna", excel_path=temp_excel)
+
+    # d2 must be auto-cancelled immediately; d3 (different slot) must remain staged
+    cancelled_ids = [c["draft_id"] for c in res["auto_cancelled_drafts"]]
+    assert cancelled_ids == [d2["draft_id"]]
+    assert res["auto_cancelled_drafts"][0]["status"] == "Cancelled"
+    remaining_ids = [d["draft_id"] for d in get_staged_drafts()]
+    assert remaining_ids == [d3["draft_id"]]
+
+    _STAGED_DRAFTS.clear()
+    _save_drafts_to_disk()
+
+
+def test_manual_sheet_edits_and_auth(tmp_path):
+    import shutil
+    import pandas as pd
+    from calendar_engine import EXCEL_PATH, save_sheet_edits, load_sheet
+
+    temp_excel = str(tmp_path / "manual_edit_calendar.xlsx")
+    shutil.copyfile(EXCEL_PATH, temp_excel)
+
+    bookings_df = load_sheet("Bookings Calendar", excel_path=temp_excel)
+    initial_count = len(bookings_df)
+
+    # Unauthorized coordinator cannot save manual edits
+    with pytest.raises(ValueError, match="CRITICAL SECURITY ERROR"):
+        save_sheet_edits("Bookings Calendar", bookings_df, approved_by="Random_User", excel_path=temp_excel)
+
+    # Staff Availability is strictly read-only and can never be modified even by an authorized coordinator
+    staff_df = load_sheet("Staff Availability", excel_path=temp_excel)
+    with pytest.raises(ValueError, match="READ-ONLY SHEET ERROR"):
+        save_sheet_edits("Staff Availability", staff_df, approved_by="Coordinator_Prashna", excel_path=temp_excel)
+
+    # Authorized coordinator edits an existing row and appends a new row
+    new_row = {
+        "Booking ID": "BK-999",
+        "Date": _next_weekday(1).strftime("%Y-%m-%d"),
+        "Time Slot": "4:00 PM - 5:00 PM",
+        "Patient Name": "Manual Entry Patient",
+        "Service Type": "Home visit",
+        "Assigned Staff": "Dr. Priya Nair",
+        "Staff Role": "Doctor",
+        "Status": "Pending",
+        "Contact Number": "+91 9876500000",
+        "Address / Area": "Powai",
+        "Notes": "Edited by hand"
+    }
+    edited_df = pd.concat([bookings_df, pd.DataFrame([new_row])], ignore_index=True)
+    saved_count = save_sheet_edits("Bookings Calendar", edited_df, approved_by="Coordinator_Prashna", excel_path=temp_excel)
+    assert saved_count == initial_count + 1
+
+    reloaded = load_sheet("Bookings Calendar", excel_path=temp_excel)
+    assert len(reloaded) == initial_count + 1
+    assert "BK-999" in reloaded["Booking ID"].values
+
+
+def test_review_bug_fixes(tmp_path):
+    import shutil
+    import openpyxl
+    from calendar_engine import EXCEL_PATH, STAGED_DRAFTS_PATH
+
+    # Bug #1: Single-time entries like "11am" (BK-111) are parsed as 1-hour slots & detected as conflicts
+    assert parse_time_range("11am") == (time(11, 0), time(12, 0))
+    assert times_overlap("11am", "11:00 AM - 12:00 PM") is True
+    assert check_conflict(staff_id="DR-01", slot="11:00 AM - 12:00 PM", date="2026-09-24") is True
+
+    # Bug #2: Same-day past time slots are excluded when min_start_time is provided
+    windows = get_available_windows("9:00 AM - 5:00 PM", [], min_start_time=time(14, 0))
+    assert "9:00 AM - 10:00 AM" not in windows
+    assert "1:00 PM - 2:00 PM" not in windows
+    assert "2:00 PM - 3:00 PM" in windows
+
+    # Bug #3: Paths are anchored to absolute paths (independent of current working directory)
+    assert os.path.isabs(EXCEL_PATH)
+    assert os.path.isabs(STAGED_DRAFTS_PATH)
+
+    # Bug #4: write_booking sets clean Excel date number_format matching existing rows
+    temp_excel = str(tmp_path / "fmt_calendar.xlsx")
+    shutil.copyfile(EXCEL_PATH, temp_excel)
+    future_tue = _next_weekday(1).strftime("%Y-%m-%d")
+    res = write_booking({
+        "patient_name": "Format Check",
+        "contact_number": "+91 9876543210",
+        "date": future_tue,
+        "time_slot": "2:00 PM - 3:00 PM",
+        "assigned_staff": "Dr. Priya Nair",
+        "staff_role": "Doctor",
+        "service_type": "Geriatric consult",
+        "address_area": "Ghatkopar"
+    }, approved_by="Coordinator_Prashna", excel_path=temp_excel)
+    wb = openpyxl.load_workbook(temp_excel)
+    try:
+        ws = wb["Bookings Calendar"]
+        matched_fmt = None
+        for r in range(6, ws.max_row + 1):
+            if ws.cell(r, 1).value == res["booking_id"]:
+                matched_fmt = ws.cell(r, 2).number_format
+                break
+        assert matched_fmt == 'ddd", "dd-mmm-yyyy'
+    finally:
+        wb.close()
